@@ -97,6 +97,53 @@ class HidePrintMessage:
         return getattr(self._original_stream, name)
 
 
+import contextlib
+import ctypes
+
+try:
+    _libc = ctypes.CDLL(None)
+except Exception:
+    _libc = None
+
+
+@contextlib.contextmanager
+def suppress_cuda_printf():
+    """Suppress CUDA device-side printf by redirecting stdout/stderr fds to /dev/null.
+
+    CUDA device printf (eg CUTLASS "Arch conditional MMA" errors on Blackwell)
+    writes to stdout fd 1 at the C level, bypassing Python sys.stdout entirely.
+    The existing HidePrintMessage filter on sys.stderr cannot catch these since
+    they go to a different fd at a different layer. This context manager redirects
+    both fd 1 and fd 2 at the OS level, syncs CUDA, then restores them.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_fds = {}
+    try:
+        for fd in (1, 2):
+            saved_fds[fd] = os.dup(fd)
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, fd)
+            os.close(devnull)
+        yield
+    finally:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+        if _libc is not None:
+            try:
+                _libc.fflush(None)
+            except Exception:
+                pass
+        for fd, saved in saved_fds.items():
+            os.dup2(saved, fd)
+            os.close(saved)
+
+
 if not UNSLOTH_ENABLE_LOGGING:
     import sys
 
@@ -894,37 +941,86 @@ def fix_triton_compiled_kernel_missing_attrs():
     )
 
 
-def fix_rocm_triton_key_error():
+def patch_trunc_normal_precision_issue():
     """
-    ROCm + torch.compile can fail if Triton lacks `triton_key`.
-    Disable Inductor/compile only on ROCm when that symbol is missing.
+    Patch torch.nn.init.trunc_normal_ for low precision tensors to run init in fp32.
+
+    torch.nn.init.trunc_normal_ can saturate at truncation bounds in fp16/bf16 on
+    some versions/backends. This was observed in TorchTitan investigations where
+    low-precision truncation produced boundary-heavy initialization behavior:
+    https://github.com/pytorch/torchtitan/pull/2342
+
+    To avoid that failure mode, initialize into a temporary fp32 tensor, then copy
+    back to the original dtype.
     """
     try:
         import torch
     except (ImportError, ModuleNotFoundError):
         return
 
-    if not getattr(torch.version, "hip", None):
+    if getattr(torch.nn.init, "_unsloth_trunc_normal_patched", False):
         return
+
+    original_trunc_normal = torch.nn.init.trunc_normal_
+    if getattr(original_trunc_normal, "__unsloth_trunc_normal_patched__", False):
+        torch.nn.init._unsloth_trunc_normal_patched = True
+        return
+
+    low_precision_dtypes = {torch.float16, torch.bfloat16}
+
+    def _call_original(target, mean, std, a, b, generator):
+        if generator is None:
+            return original_trunc_normal(target, mean = mean, std = std, a = a, b = b)
+        try:
+            return original_trunc_normal(
+                target, mean = mean, std = std, a = a, b = b, generator = generator
+            )
+        except TypeError as exc:
+            # Older torch versions may not accept a generator keyword argument.
+            msg = str(exc).lower()
+            if "unexpected keyword argument" in msg and "generator" in msg:
+                return original_trunc_normal(target, mean = mean, std = std, a = a, b = b)
+            raise
 
     try:
-        import triton
-    except (ImportError, ModuleNotFoundError):
-        return
+        from torch.distributed._tensor import DTensor
+    except Exception:
+        DTensor = None
 
-    try:
-        from triton.runtime import triton_key  # noqa: F401
+    @torch.no_grad()
+    def _patched_trunc_normal_(
+        tensor,
+        mean: float = 0.0,
+        std: float = 1.0,
+        a: float = -2.0,
+        b: float = 2.0,
+        generator = None,
+    ):
+        if DTensor is not None and isinstance(tensor, DTensor):
+            local_tensor = getattr(tensor, "_local_tensor", None)
+            if local_tensor is None:
+                return _call_original(tensor, mean, std, a, b, generator)
+            if local_tensor.dtype in low_precision_dtypes:
+                local_fp32 = local_tensor.float()
+                _call_original(local_fp32, mean, std, a, b, generator)
+                local_tensor.copy_(local_fp32.to(dtype = local_tensor.dtype))
+                return tensor
+            return _call_original(tensor, mean, std, a, b, generator)
 
-        return
-    except ImportError:
-        pass
+        if tensor.dtype in low_precision_dtypes:
+            tensor_fp32 = tensor.float()
+            _call_original(tensor_fp32, mean, std, a, b, generator)
+            tensor.copy_(tensor_fp32.to(dtype = tensor.dtype))
+            return tensor
 
-    os.environ.setdefault("TORCHINDUCTOR_DISABLE", "1")
-    os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
-    logger.info(
-        "Unsloth: ROCm detected and Triton lacks triton_key; "
-        "disabling torch.compile/Inductor to avoid backend crash."
-    )
+        return _call_original(tensor, mean, std, a, b, generator)
+
+    _patched_trunc_normal_.__unsloth_trunc_normal_patched__ = True
+    _patched_trunc_normal_._unsloth_original = original_trunc_normal
+    torch.nn.init._unsloth_trunc_normal_original = original_trunc_normal
+    torch.nn.init.trunc_normal_ = _patched_trunc_normal_
+    torch.nn.init._unsloth_trunc_normal_patched = True
+    logger.info("Unsloth: Patched torch.nn.init.trunc_normal_ for fp16/bf16 stability.")
 
 
 def check_vllm_torch_sm100_compatibility():
@@ -1385,10 +1481,76 @@ def _is_broken_vllm_error(error) -> bool:
             )
         ) or ("vllm" in message and "undefined symbol" in message):
             return True
+        # Also catch CUDA shared library mismatches during vllm import
+        # e.g. "libcudart.so.12: cannot open shared object file"
+        if (
+            "libcudart" in message or "libcublas" in message or "libnvrtc" in message
+        ) and "cannot open shared object file" in message:
+            return True
         current = getattr(current, "__cause__", None) or getattr(
             current, "__context__", None
         )
     return False
+
+
+def _get_vllm_cuda_mismatch_message(error):
+    """If the error is a CUDA version mismatch, return a helpful install message."""
+    import re as _re
+
+    checked = set()
+    current = error
+    wanted_cuda = None
+    while current is not None and id(current) not in checked:
+        checked.add(id(current))
+        message = str(current)
+        # Extract the CUDA version vllm was built for, e.g. "libcudart.so.12"
+        match = _re.search(r"libcudart\.so\.(\d+)", message)
+        if match:
+            wanted_cuda = match.group(1)
+            break
+        current = getattr(current, "__cause__", None) or getattr(
+            current, "__context__", None
+        )
+    if wanted_cuda is None:
+        return None
+
+    # Detect what CUDA version is actually available on the system
+    system_cuda_display = None  # Human-readable, e.g. "13.0"
+    system_cuda_tag = None  # For wheel URL, e.g. "130"
+    try:
+        import torch
+
+        cuda_version = torch.version.cuda  # e.g. "13.0" or "12.8"
+        if cuda_version:
+            system_cuda_display = cuda_version
+            system_cuda_tag = cuda_version.replace(".", "")[:3]  # "130" or "128"
+    except Exception:
+        pass
+
+    if system_cuda_tag is None or system_cuda_tag.startswith(wanted_cuda):
+        return None  # Not a mismatch or can't determine
+
+    try:
+        vllm_version = importlib_version("vllm").split("+")[0]
+    except Exception:
+        vllm_version = "VLLM_VERSION"
+
+    cpu_arch = "x86_64"
+    try:
+        import platform
+
+        cpu_arch = platform.machine()
+    except Exception:
+        pass
+
+    return (
+        f"Unsloth: vLLM was built for CUDA {wanted_cuda} but this system has "
+        f"CUDA {system_cuda_display}. Please reinstall vLLM with the correct CUDA version:\n"
+        f"\n"
+        f"  uv pip install https://github.com/vllm-project/vllm/releases/download/"
+        f"v{vllm_version}/vllm-{vllm_version}+cu{system_cuda_tag}-cp38-abi3-"
+        f"manylinux_2_35_{cpu_arch}.whl"
+    )
 
 
 class _CausalConv1dImportBlockerLoader(importlib.abc.Loader):
@@ -1539,12 +1701,16 @@ def disable_broken_vllm(error = None):
     VLLM_BROKEN = True
     _clear_vllm_modules()
     _install_vllm_blocker()
-    logger.warning(
-        "Unsloth: Detected broken vLLM binary extension; "
-        "disabling vLLM imports and continuing import.\n"
-        "Please reinstall via `uv pip install unsloth vllm torchvision torchaudio "
-        "--torch-backend=auto`."
-    )
+    cuda_msg = _get_vllm_cuda_mismatch_message(failure)
+    if cuda_msg:
+        logger.warning(cuda_msg)
+    else:
+        logger.warning(
+            "Unsloth: Detected broken vLLM binary extension; "
+            "disabling vLLM imports and continuing import.\n"
+            "Please reinstall via `uv pip install unsloth vllm torchvision torchaudio "
+            "--torch-backend=auto`."
+        )
     return True
 
 

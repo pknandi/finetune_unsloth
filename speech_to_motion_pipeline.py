@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+# 1. FIXED: Unsloth imported FIRST to apply optimizations and avoid the warning
+from unsloth import FastLanguageModel
+
+import soundfile as sf
+
 import json
 from pathlib import Path
 from typing import List, Optional
@@ -11,11 +16,13 @@ import numpy as np
 import pandas as pd
 import torch
 import torchaudio
-from audiocraft.models.encodec import EncodecModel
+
+# 2. FIXED: Imported from standalone 'encodec' instead of 'audiocraft'
+from encodec import EncodecModel
 from encodec.utils import convert_audio
+
 from sklearn.cluster import MiniBatchKMeans
 from transformers import TrainingArguments, Trainer, default_data_collator
-from unsloth import FastLanguageModel
 
 
 # =========================
@@ -190,7 +197,15 @@ def tokenize_audio_encodec(audio_path: str | Path, bandwidth: float = 6.0) -> np
     model = EncodecModel.encodec_model_24khz()
     model.set_target_bandwidth(bandwidth)
 
-    wav, sr = torchaudio.load(str(audio_path))
+    # BULLETPROOF FIX: Use soundfile directly instead of torchaudio
+    wav_np, sr = sf.read(str(audio_path), dtype="float32")
+    
+    # Soundfile loads as (frames, channels), PyTorch expects (channels, frames)
+    wav = torch.from_numpy(wav_np).t() 
+    if wav.ndim == 1:
+        wav = wav.unsqueeze(0)
+
+    # Convert audio to Encodec's expected sample rate and channels
     wav = convert_audio(wav, sr, model.sample_rate, model.channels)
     wav = wav.unsqueeze(0)
 
@@ -343,10 +358,10 @@ def finetune(
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         learning_rate=2e-4,
-        warmup_steps=50,
-        max_steps=1000,
-        logging_steps=10,
-        save_steps=200,
+        warmup_steps=2,
+        max_steps=10,
+        logging_steps=5,
+        save_steps=5,
         bf16=torch.cuda.is_available(),
         fp16=not torch.cuda.is_available(),
         optim="adamw_torch",
@@ -374,19 +389,19 @@ def finetune(
 if __name__ == "__main__":
     # 1) Build joint JSONL:
     # build_joint_jsonl(
-    #     csv_path="datasets.csv",
-    #     motion_tokenizer_path="motion_tokenizer/tokenizer.pkl",
-    #     normalizer_path="motion_tokenizer/normalizer.npz",
+    #     csv_path="dataset_mapping.csv",
+    #     motion_tokenizer_path="motion_tokenizer_artifacts/tokenizer.pkl",
+    #     normalizer_path="motion_tokenizer_artifacts/normalizer.npz",
     #     output_jsonl="speech_motion_train.jsonl",
     #     audio_bandwidth=6.0,
     # )
 
     # 2) Finetune:
-    # finetune(
-    #     base_model_name="your-base-llm-here",
-    #     train_jsonl="speech_motion_train.jsonl",
-    #     output_dir="speech_motion_outputs",
-    #     max_seq_length=4096,
-    #     load_in_4bit=True,
-    # )
+    finetune(
+        base_model_name="unsloth/orpheus-3b-0.1-pretrained",
+        train_jsonl="speech_motion_train.jsonl",
+        output_dir="speech_motion_outputs",
+        max_seq_length=4096,
+        load_in_4bit=True,
+    )
     pass

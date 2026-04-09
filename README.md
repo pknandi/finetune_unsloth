@@ -1,3 +1,12 @@
+## Steps (WIP - Not fully tested)
+* sudo apt-get update
+* sudo apt install pkg-config libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev libavfilter-dev libswscale-dev libswresample-dev
+* sudo apt install conda-forge ffmpeg av cython spacy thinc
+* for conda environment, conda install -c conda-forge ffmpeg av cython spacy thinc
+* pip3 install audiocraft --no-deps
+* pip3 install -r requirements.txt
+
+
 <h1 align="center" style="margin:0;">
   <a href="https://unsloth.ai/docs"><picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/unslothai/unsloth/main/images/STUDIO%20WHITE%20LOGO.png">

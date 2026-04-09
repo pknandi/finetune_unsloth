@@ -263,10 +263,8 @@ def build_joint_jsonl(
                     "id": str(i),
                     "audio_filename": audio_path,
                     "motion_dirname": motion_dir,
-                    "text": build_text_row(
-                        audio_tokens_to_text(audio_codes),
-                        motion_tokens_to_text(motion_codes),
-                    ),
+                    "prompt": audio_tokens_to_text(audio_codes),
+                    "completion": motion_tokens_to_text(motion_codes),
                 }
                 f.write(json.dumps(sample, ensure_ascii=False) + "\n")
             except Exception as e:
@@ -296,23 +294,88 @@ def add_discrete_tokens(tokenizer, audio_codebook_size=1024, audio_num_codebooks
     return tokenizer
 
 
-def encode_for_training(example, tokenizer, response_marker="<|motion|>", max_length=4096):
-    text = example["text"]
-    enc = tokenizer(text, truncation=True, max_length=max_length, add_special_tokens=True)
+def encode_for_training(
+    example,
+    tokenizer,
+    max_seq_length=8192,
+    prompt_max_length=2048,
+    completion_max_length=6144,
+):
+    prompt_ids = tokenizer(
+        example["prompt"],
+        add_special_tokens=True,
+        truncation=True,
+        max_length=prompt_max_length,
+    )["input_ids"]
 
-    input_ids = enc["input_ids"]
-    marker_ids = tokenizer(response_marker, add_special_tokens=False)["input_ids"]
-    idx = _find_subsequence(input_ids, marker_ids)
+    completion_ids = tokenizer(
+        example["completion"],
+        add_special_tokens=False,
+        truncation=True,
+        max_length=completion_max_length,
+    )["input_ids"]
 
-    labels = input_ids.copy()
-    if idx == -1:
-        labels = [-100] * len(input_ids)
-    else:
-        cutoff = idx + len(marker_ids)
-        labels[:cutoff] = [-100] * cutoff
+    input_ids = prompt_ids + completion_ids
+    labels = [-100] * len(prompt_ids) + completion_ids
 
-    enc["labels"] = labels
-    return enc
+    if len(input_ids) > max_seq_length:
+        input_ids = input_ids[:max_seq_length]
+        labels = labels[:max_seq_length]
+
+    active = sum(x != -100 for x in labels)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": [1] * len(input_ids),
+        "labels": labels,
+        "active_label_tokens": active,
+    }
+
+
+# =========================
+# 6) Debugging utilities
+# =========================
+
+def debug_example(example, tokenizer, max_seq_length=8192, prompt_max_length=2048, completion_max_length=6144):
+    prompt_ids = tokenizer(
+        example["prompt"],
+        add_special_tokens=True,
+        truncation=True,
+        max_length=prompt_max_length,
+    )["input_ids"]
+
+    completion_ids = tokenizer(
+        example["completion"],
+        add_special_tokens=False,
+        truncation=True,
+        max_length=completion_max_length,
+    )["input_ids"]
+
+    input_ids = prompt_ids + completion_ids
+    labels = [-100] * len(prompt_ids) + completion_ids
+
+    if len(input_ids) > max_seq_length:
+        input_ids = input_ids[:max_seq_length]
+        labels = labels[:max_seq_length]
+
+    active = sum(x != -100 for x in labels)
+    print("prompt tokens:", len(prompt_ids))
+    print("completion tokens:", len(completion_ids))
+    print("total tokens:", len(input_ids))
+    print("active label tokens:", active)
+    return active
+
+# def debug_example(example, tokenizer, max_length=4096):
+#     # Call your actual training encoder so we see exactly what the model sees
+#     enc = encode_for_training(example, tokenizer, max_length=max_length)
+    
+#     input_ids = enc["input_ids"]
+#     labels = enc["labels"]
+    
+#     # Count how many tokens are NOT masked out by -100
+#     active = sum(x != -100 for x in labels)
+    
+#     print(f"seq len: {len(input_ids)} | active label tokens: {active}")
+#     return active
 
 
 # =========================
@@ -323,7 +386,9 @@ def finetune(
     base_model_name: str,
     train_jsonl: str | Path,
     output_dir: str | Path,
-    max_seq_length: int = 4096,
+    max_seq_length: int = 8192,
+    prompt_max_length: int = 2048,
+    completion_max_length: int = 6144,
     load_in_4bit: bool = True,
 ):
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -351,17 +416,21 @@ def finetune(
     from datasets import load_dataset
 
     dataset = load_dataset("json", data_files=str(train_jsonl), split="train")
-    dataset = dataset.map(lambda ex: encode_for_training(ex, tokenizer, max_length=max_seq_length))
+    for i in range(min(3, len(dataset))):
+        debug_example(dataset[i], tokenizer, max_seq_length=max_seq_length, prompt_max_length=prompt_max_length, completion_max_length=completion_max_length)
+    dataset = dataset.map(lambda ex: encode_for_training(ex, tokenizer, max_seq_length=max_seq_length, prompt_max_length=prompt_max_length, completion_max_length=completion_max_length), num_proc=2)
+
+    print(dataset[0]["active_label_tokens"])
 
     args = TrainingArguments(
         output_dir=str(output_dir),
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         learning_rate=2e-4,
-        warmup_steps=2,
-        max_steps=10,
+        warmup_steps=10,
+        max_steps=100,
         logging_steps=5,
-        save_steps=5,
+        save_steps=50,
         bf16=torch.cuda.is_available(),
         fp16=not torch.cuda.is_available(),
         optim="adamw_torch",
@@ -401,7 +470,9 @@ if __name__ == "__main__":
         base_model_name="unsloth/orpheus-3b-0.1-pretrained",
         train_jsonl="speech_motion_train.jsonl",
         output_dir="speech_motion_outputs",
-        max_seq_length=4096,
+        max_seq_length=8192,
+        prompt_max_length=2048,
+        completion_max_length=6144,
         load_in_4bit=True,
     )
     pass

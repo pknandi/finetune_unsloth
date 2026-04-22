@@ -1,11 +1,48 @@
-## Steps (WIP - Not fully tested)
-* sudo apt-get update
-* sudo apt install pkg-config libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev libavfilter-dev libswscale-dev libswresample-dev
-* sudo apt install conda-forge ffmpeg av cython spacy thinc
-* for conda environment, conda install -c conda-forge ffmpeg av cython spacy thinc
-* pip3 install audiocraft --no-deps
-* pip3 install -r requirements.txt
+## Steps - Installation (WIP - Not fully tested)
+```bash 
+sudo apt-get update
+```
 
+```bash 
+sudo apt install pkg-config libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev libavfilter-dev libswscale-dev libswresample-dev
+```
+```bash
+sudo apt install conda-forge ffmpeg av cython spacy thinc
+# for conda environment, 
+conda install -c conda-forge ffmpeg av cython spacy thinc
+```
+```bash
+pip3 install audiocraft --no-deps
+```
+```bash
+pip3 install -r requirements.txt
+```
+
+## Create Tokenizer
+### create csv file for tokenizer dataset
+**first update the dataset dir in the script, then run the command** 
+```bash
+python3 dataset_to_csv.py
+```
+### create motion token codebook
+```bash
+python3 k_means_motion_tokenizer.py --csv_path <saved_csv_file_from_previous_step> --save_dir <dir_to_save_tokens>
+```
+
+## Finetune
+### update dataset dir and create dataset mapper for training data
+```bash
+python3 dataset_to_csv.py
+```
+### start fine tuning
+* **Uncomment build_joint_jsonl, comment out finetune, run once to process training data**
+```bash
+python3 speech_to_motion_pipeline.py
+```
+* **Comment out build_joint_jsonl, uncomment finetune, run again to start finetuning**
+```bash
+python3 speech_to_motion_pipeline.py
+```
 
 <h1 align="center" style="margin:0;">
   <a href="https://unsloth.ai/docs"><picture>

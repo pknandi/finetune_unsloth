@@ -221,3 +221,4 @@ package-lock.json
 speech_motion_outputs/
 
 _unsloth*
+models/

@@ -219,3 +219,5 @@ package-lock.json
 
 # custom
 speech_motion_outputs/
+
+_unsloth*

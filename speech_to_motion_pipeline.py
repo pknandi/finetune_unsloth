@@ -15,7 +15,6 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
-import torchaudio
 
 # 2. FIXED: Imported from standalone 'encodec' instead of 'audiocraft'
 from encodec import EncodecModel
@@ -124,6 +123,7 @@ def preprocess_motion(motion: np.ndarray) -> np.ndarray:
 # 2) Motion tokenizer
 # =========================
 
+
 class Normalizer:
     def __init__(self):
         self.mean = None
@@ -189,6 +189,7 @@ def encode_motion_from_dir(motion_dirname: str | Path, motion_tokenizer: MotionT
 # 3) Audio tokenization with EnCodec
 # =========================
 
+
 def tokenize_audio_encodec(audio_path: str | Path, bandwidth: float = 6.0) -> np.ndarray:
     """
     Returns:
@@ -199,9 +200,9 @@ def tokenize_audio_encodec(audio_path: str | Path, bandwidth: float = 6.0) -> np
 
     # BULLETPROOF FIX: Use soundfile directly instead of torchaudio
     wav_np, sr = sf.read(str(audio_path), dtype="float32")
-    
+
     # Soundfile loads as (frames, channels), PyTorch expects (channels, frames)
-    wav = torch.from_numpy(wav_np).t() 
+    wav = torch.from_numpy(wav_np).t()
     if wav.ndim == 1:
         wav = wav.unsqueeze(0)
 
@@ -236,6 +237,7 @@ def build_text_row(audio_tokens: str, motion_tokens: str) -> str:
 # =========================
 # 4) Build training JSONL
 # =========================
+
 
 def build_joint_jsonl(
     csv_path: str | Path,
@@ -274,6 +276,7 @@ def build_joint_jsonl(
 # =========================
 # 5) Training token prep
 # =========================
+
 
 def _find_subsequence(seq: List[int], subseq: List[int]) -> int:
     if not subseq or len(subseq) > len(seq):
@@ -335,7 +338,14 @@ def encode_for_training(
 # 6) Debugging utilities
 # =========================
 
-def debug_example(example, tokenizer, max_seq_length=8192, prompt_max_length=2048, completion_max_length=6144):
+
+def debug_example(
+    example,
+    tokenizer,
+    max_seq_length=8192,
+    prompt_max_length=2048,
+    completion_max_length=6144,
+):
     prompt_ids = tokenizer(
         example["prompt"],
         add_special_tokens=True,
@@ -364,16 +374,17 @@ def debug_example(example, tokenizer, max_seq_length=8192, prompt_max_length=204
     print("active label tokens:", active)
     return active
 
+
 # def debug_example(example, tokenizer, max_length=4096):
 #     # Call your actual training encoder so we see exactly what the model sees
 #     enc = encode_for_training(example, tokenizer, max_length=max_length)
-    
+
 #     input_ids = enc["input_ids"]
 #     labels = enc["labels"]
-    
+
 #     # Count how many tokens are NOT masked out by -100
 #     active = sum(x != -100 for x in labels)
-    
+
 #     print(f"seq len: {len(input_ids)} | active label tokens: {active}")
 #     return active
 
@@ -381,6 +392,7 @@ def debug_example(example, tokenizer, max_seq_length=8192, prompt_max_length=204
 # =========================
 # 6) Fine-tuning with Unsloth
 # =========================
+
 
 def finetune(
     base_model_name: str,
@@ -411,14 +423,22 @@ def finetune(
         bias="none",
         use_gradient_checkpointing="unsloth",
         random_state=3407,
+        modules_to_save=["embed_tokens", "lm_head"],
     )
 
     from datasets import load_dataset
 
     dataset = load_dataset("json", data_files=str(train_jsonl), split="train")
     for i in range(min(3, len(dataset))):
-        debug_example(dataset[i], tokenizer, max_seq_length=max_seq_length, prompt_max_length=prompt_max_length, completion_max_length=completion_max_length)
-    dataset = dataset.map(lambda ex: encode_for_training(ex, tokenizer, max_seq_length=max_seq_length, prompt_max_length=prompt_max_length, completion_max_length=completion_max_length), num_proc=2)
+        debug_example(
+            dataset[i], tokenizer, max_seq_length=max_seq_length, prompt_max_length=prompt_max_length, completion_max_length=completion_max_length
+        )
+    dataset = dataset.map(
+        lambda ex: encode_for_training(
+            ex, tokenizer, max_seq_length=max_seq_length, prompt_max_length=prompt_max_length, completion_max_length=completion_max_length
+        ),
+        num_proc=2,
+    )
 
     print(dataset[0]["active_label_tokens"])
 
@@ -428,9 +448,9 @@ def finetune(
         gradient_accumulation_steps=4,
         learning_rate=2e-4,
         warmup_steps=10,
-        max_steps=100,
+        max_steps=200,
         logging_steps=5,
-        save_steps=50,
+        save_steps=100,
         bf16=torch.cuda.is_available(),
         fp16=not torch.cuda.is_available(),
         optim="adamw_torch",

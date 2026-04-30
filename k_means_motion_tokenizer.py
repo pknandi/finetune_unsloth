@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
+import json
 
 import joblib
 import numpy as np
@@ -315,7 +315,7 @@ def tokenize_csv_to_jsonl(
                     "motion_dirname": motion_dir,
                     "motion_tokens": tokens_to_text(tokens),
                 }
-                f.write(pd.Series(sample).to_json(force_ascii=False) + "\n")
+                f.write(json.dumps(sample, ensure_ascii=False) + "\n")
                 written += 1
             except Exception as e:
                 print(f"Skipping row {i} ({motion_dir}): {e}")

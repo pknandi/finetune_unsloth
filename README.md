@@ -44,6 +44,32 @@ python3 speech_to_motion_pipeline.py
 python3 speech_to_motion_pipeline.py
 ```
 
+## Inference and 3D Motion Visualization
+### Run this script for inference
+* **Update audio_path, finetuned model_dir, tokenizer path**
+```bash
+python3 run_inference.py
+```
+
+### Visualizing Motion
+* **Download the SMPL-X Body Models**
+  * Go to the official SMPL-X website: https://smpl-x.is.tue.mpg.de/
+  * Register for an account
+  * Under the Downloads section, download the **SMPL-X v1.1** model files
+  * Extract that zip file. You will see a folder named models/smplx. Move that entire models folder into the root directory of the repo.
+* **Install Rendering Libraries**
+```bash
+pip3 install smplx trimesh matplotlib
+```
+* **Run this Script for output**
+```bash
+python3 visualize_motion.py
+```
+It generates an output mp4 video of the skeletal joints moving.
+
+It exports the first 100 frames as standard .obj 3D meshes inside a folder. You can drag and drop these .obj files into any 3D software (like Blender or an online 3D viewer) to see the high-quality human mesh.
+
+
 <h1 align="center" style="margin:0;">
   <a href="https://unsloth.ai/docs"><picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/unslothai/unsloth/main/images/STUDIO%20WHITE%20LOGO.png">

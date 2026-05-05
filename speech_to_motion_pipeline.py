@@ -448,9 +448,9 @@ def finetune(
         gradient_accumulation_steps=4,
         learning_rate=2e-4,
         warmup_steps=10,
-        max_steps=200,
+        max_steps=500,
         logging_steps=5,
-        save_steps=100,
+        save_steps=250,
         bf16=torch.cuda.is_available(),
         fp16=not torch.cuda.is_available(),
         optim="adamw_torch",
@@ -478,11 +478,11 @@ def finetune(
 if __name__ == "__main__":
     # 1) Build joint JSONL:
     # build_joint_jsonl(
-    #     csv_path="dataset_mapping.csv",
+    #     csv_path="training_dataset_mapping.csv",
     #     motion_tokenizer_path="motion_tokenizer_artifacts/tokenizer.pkl",
     #     normalizer_path="motion_tokenizer_artifacts/normalizer.npz",
     #     output_jsonl="speech_motion_train.jsonl",
-    #     audio_bandwidth=6.0,
+    #     audio_bandwidth=24.0,
     # )
 
     # 2) Finetune:
@@ -491,8 +491,8 @@ if __name__ == "__main__":
         train_jsonl="speech_motion_train.jsonl",
         output_dir="speech_motion_outputs",
         max_seq_length=8192,
-        prompt_max_length=2048,
-        completion_max_length=6144,
+        prompt_max_length=3072,
+        completion_max_length=5120,
         load_in_4bit=True,
     )
     pass

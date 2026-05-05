@@ -222,3 +222,7 @@ speech_motion_outputs/
 
 _unsloth*
 models/
+speech_motion_train.jsonl
+exported_meshes/
+*.mp4
+*.npy

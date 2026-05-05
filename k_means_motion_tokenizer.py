@@ -332,7 +332,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_clusters", type=int, default=1024)
     parser.add_argument("--include_betas", action="store_true")
     parser.add_argument("--tokenize_jsonl", action="store_true")
-    parser.add_argument("--output_jsonl", type=str, default="train.jsonl")
+    parser.add_argument("--output_jsonl", type=str, default="tokenized_data.jsonl")
     args = parser.parse_args()
 
     fit_tokenizer_from_csv(

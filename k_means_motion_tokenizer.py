@@ -324,29 +324,40 @@ def tokenize_csv_to_jsonl(
 
 
 if __name__ == "__main__":
-    import argparse
+    # ==========================================
+    # Configuration Variables
+    # ==========================================
+    CSV_PATH = "datasets/tokenizer_dataset_mapping.csv"
+    SAVE_DIR = "motion_tokenizer_artifacts"  # Directory to save tokenizer.pkl and normalizer.npz
+    N_CLUSTERS = 1024  # Number of K-Means clusters (vocab size)
+    INCLUDE_BETAS = False  # Whether to include shape parameters
+    TOKENIZE_JSONL = True  # Whether to also generate the .jsonl file
+    OUTPUT_JSONL = "datasets/tokenized_data.jsonl"
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--csv_path", type=str, required=True)
-    parser.add_argument("--save_dir", type=str, required=True)
-    parser.add_argument("--n_clusters", type=int, default=1024)
-    parser.add_argument("--include_betas", action="store_true")
-    parser.add_argument("--tokenize_jsonl", action="store_true")
-    parser.add_argument("--output_jsonl", type=str, default="tokenized_data.jsonl")
-    args = parser.parse_args()
-
+    # 1. Fit and save the tokenizer and normalizer
     fit_tokenizer_from_csv(
-        csv_path=args.csv_path,
-        save_dir=args.save_dir,
-        n_clusters=args.n_clusters,
-        include_betas=args.include_betas,
+        csv_path=CSV_PATH,
+        save_dir=SAVE_DIR,
+        n_clusters=N_CLUSTERS,
+        include_betas=INCLUDE_BETAS,
     )
 
-    if args.tokenize_jsonl:
+    # 2. Optionally tokenize the dataset into a JSONL file
+    """This jsonl will contain entries like:
+    {   
+        "id": "0",
+        "audio_filename": "path/to/audio.wav",
+        "motion_dirname": "path/to/smplx/sequence",
+        "motion_tokens": "<m_42> <m_17> <m_999> ...",
+    }
+    There is no audio token here. Main purpose is to debug and visualize the tokenization training. No dependency on this jsonl for training or inference.
+    If you want to skip this step, simply set TOKENIZE_JSONL = False.
+    """
+    if TOKENIZE_JSONL:
         tokenize_csv_to_jsonl(
-            csv_path=args.csv_path,
-            tokenizer_path=Path(args.save_dir) / "tokenizer.pkl",
-            normalizer_path=Path(args.save_dir) / "normalizer.npz",
-            output_jsonl=args.output_jsonl,
-            include_betas=args.include_betas,
+            csv_path=CSV_PATH,
+            tokenizer_path=Path(SAVE_DIR) / "tokenizer.pkl",
+            normalizer_path=Path(SAVE_DIR) / "normalizer.npz",
+            output_jsonl=OUTPUT_JSONL,
+            include_betas=INCLUDE_BETAS,
         )

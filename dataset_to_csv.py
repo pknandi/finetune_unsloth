@@ -41,6 +41,8 @@ def generate_dataset_csv(root_folder: str, output_csv: str = "dataset_mapping.cs
 
 
 if __name__ == "__main__":
+    # ROOT_FOLDER = "./datasets/tokenizer_dataset"
     ROOT_FOLDER = "./datasets/training_dataset"
 
-    generate_dataset_csv(ROOT_FOLDER, output_csv="training_dataset_mapping.csv")
+    # generate_dataset_csv(ROOT_FOLDER, output_csv="datasets/tokenizer_dataset_mapping.csv")
+    generate_dataset_csv(ROOT_FOLDER, output_csv="datasets/training_dataset_mapping.csv")

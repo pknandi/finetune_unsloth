@@ -478,17 +478,17 @@ def finetune(
 if __name__ == "__main__":
     # 1) Build joint JSONL:
     # build_joint_jsonl(
-    #     csv_path="training_dataset_mapping.csv",
+    #     csv_path="datasets/training_dataset_mapping.csv",
     #     motion_tokenizer_path="motion_tokenizer_artifacts/tokenizer.pkl",
     #     normalizer_path="motion_tokenizer_artifacts/normalizer.npz",
-    #     output_jsonl="speech_motion_train.jsonl",
-    #     audio_bandwidth=24.0,
+    #     output_jsonl="datasets/speech_motion_train.jsonl",
+    #     audio_bandwidth=6.0,
     # )
 
     # 2) Finetune:
     finetune(
         base_model_name="unsloth/orpheus-3b-0.1-pretrained",
-        train_jsonl="speech_motion_train.jsonl",
+        train_jsonl="datasets/speech_motion_train.jsonl",
         output_dir="speech_motion_outputs",
         max_seq_length=8192,
         prompt_max_length=3072,

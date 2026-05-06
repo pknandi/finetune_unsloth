@@ -72,10 +72,10 @@ def render_motion(npy_path: str, smplx_model_dir: str):
     ani = animation.FuncAnimation(fig, update, frames=num_frames, interval=1000 / 30)
 
     # Save using ffmpeg
-    ani.save("output_motion.mp4", writer="ffmpeg", fps=30)
-    print("Done! You can now download 'output_motion.mp4' to watch the animation.")
+    ani.save(f"inference_data/output/output_motion_{npy_file_name.split('.')[0]}.mp4", writer="ffmpeg", fps=30)
+    print("Done! You can now download 'output_motion_daylife.mp4' to watch the animation.")
 
 
 if __name__ == "__main__":
-    # UPDATE THIS PATH to point to the folder you downloaded and extracted!
-    render_motion(npy_path="generated_motion.npy", smplx_model_dir="models")
+    npy_file_name = "generated_motion_daylife.npy"
+    render_motion(npy_path=f"inference_data/output/{npy_file_name}", smplx_model_dir="models")

@@ -226,3 +226,4 @@ speech_motion_train.jsonl
 exported_meshes/
 *.mp4
 *.npy
+inference_data/

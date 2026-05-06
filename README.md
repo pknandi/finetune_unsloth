@@ -1,4 +1,4 @@
-## Steps - Installation (WIP - Not fully tested)
+## Steps - Installation
 ```bash 
 sudo apt-get update
 ```
@@ -20,13 +20,14 @@ pip3 install -r requirements.txt
 
 ## Create Tokenizer
 ### create csv file for tokenizer dataset
-**first update the dataset dir in the script, then run the command** 
+* **first update the dataset dir in the script, then run the command** 
 ```bash
 python3 dataset_to_csv.py
 ```
 ### create motion token codebook
+* **Update the configurations in the script first. Then run**
 ```bash
-python3 k_means_motion_tokenizer.py --csv_path <saved_csv_file_from_previous_step> --save_dir <dir_to_save_tokens>
+python3 k_means_motion_tokenizer.py
 ```
 
 ## Finetune

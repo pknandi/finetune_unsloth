@@ -142,10 +142,11 @@ def generate_motion_from_audio(audio_path: str, lora_model_dir: str, tokenizer_p
 
 
 if __name__ == "__main__":
+    audio_file_name = "DAYLIFE_Doing_chores_together--186171-190520.wav"
     generate_motion_from_audio(
-        audio_path="ACTING_Town_hall_meeting--103981-108180.wav",
+        audio_path=f"inference_data/input/{audio_file_name}",
         lora_model_dir="speech_motion_outputs/lora",
         tokenizer_path="motion_tokenizer_artifacts/tokenizer.pkl",
         normalizer_path="motion_tokenizer_artifacts/normalizer.npz",
-        output_npy_path="generated_motion.npy",
+        output_npy_path=f"inference_data/output/generated_motion_{audio_file_name.split('.')[0]}.npy",
     )

@@ -142,7 +142,7 @@ def generate_motion_from_audio(audio_path: str, lora_model_dir: str, tokenizer_p
 
 
 if __name__ == "__main__":
-    audio_file_name = "DAYLIFE_Doing_chores_together--186171-190520.wav"
+    audio_file_name = "c--20250122--1350--ZPZ640--HXR046--FGI958--DLF703--pilot--MotionPrior--DAYLIFE_Doing_chores_together--186171-190520.wav"
     generate_motion_from_audio(
         audio_path=f"inference_data/input/{audio_file_name}",
         lora_model_dir="speech_motion_outputs/lora",

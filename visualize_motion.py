@@ -73,9 +73,11 @@ def render_motion(npy_path: str, smplx_model_dir: str):
 
     # Save using ffmpeg
     ani.save(f"inference_data/output/output_motion_{npy_file_name.split('.')[0]}.mp4", writer="ffmpeg", fps=30)
-    print("Done! You can now download 'output_motion_daylife.mp4' to watch the animation.")
+    print(f"Done! You can now download 'output_motion_{npy_file_name.split('.')[0]}.mp4' to watch the animation.")
 
 
 if __name__ == "__main__":
-    npy_file_name = "generated_motion_daylife.npy"
+    npy_file_name = (
+        "generated_motion_c--20250122--1350--ZPZ640--HXR046--FGI958--DLF703--pilot--MotionPrior--DAYLIFE_Doing_chores_together--186171-190520.npy"
+    )
     render_motion(npy_path=f"inference_data/output/{npy_file_name}", smplx_model_dir="models")

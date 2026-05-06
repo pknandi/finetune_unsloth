@@ -16,6 +16,8 @@ import numpy as np
 import pandas as pd
 import torch
 
+import wandb
+
 # 2. FIXED: Imported from standalone 'encodec' instead of 'audiocraft'
 from encodec import EncodecModel
 from encodec.utils import convert_audio
@@ -403,6 +405,9 @@ def finetune(
     completion_max_length: int = 6144,
     load_in_4bit: bool = True,
 ):
+    # Initialize the W&B run
+    wandb.init(project="speech-to-motion", name="orpheus-3b-finetune")
+
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=base_model_name,
         max_seq_length=max_seq_length,
@@ -448,15 +453,16 @@ def finetune(
         gradient_accumulation_steps=4,
         learning_rate=2e-4,
         warmup_steps=10,
-        max_steps=500,
+        max_steps=2000,
         logging_steps=5,
-        save_steps=250,
+        save_steps=1000,
         bf16=torch.cuda.is_available(),
         fp16=not torch.cuda.is_available(),
         optim="adamw_torch",
         weight_decay=0.01,
         lr_scheduler_type="cosine",
-        report_to="none",
+        report_to="wandb",
+        run_name="orpheus-3b-finetune",
     )
 
     trainer = Trainer(
@@ -470,6 +476,9 @@ def finetune(
 
     model.save_pretrained(str(Path(output_dir) / "lora"))
     tokenizer.save_pretrained(str(Path(output_dir) / "lora"))
+
+    # Close the W&B run cleanly at the end
+    wandb.finish()
 
 
 # =========================

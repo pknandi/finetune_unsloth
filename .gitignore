@@ -230,3 +230,4 @@ inference_data/
 motion_tokenizer_artifacts/
 *.csv
 *.jsonl
+wandb/

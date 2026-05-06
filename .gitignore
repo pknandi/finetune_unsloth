@@ -227,3 +227,6 @@ exported_meshes/
 *.mp4
 *.npy
 inference_data/
+motion_tokenizer_artifacts/
+*.csv
+*.jsonl

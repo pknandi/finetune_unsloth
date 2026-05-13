@@ -1,5 +1,6 @@
 import csv
 from pathlib import Path
+import argparse
 
 
 def generate_dataset_csv(root_folder: str, output_csv: str = "dataset_mapping.csv"):
@@ -41,8 +42,10 @@ def generate_dataset_csv(root_folder: str, output_csv: str = "dataset_mapping.cs
 
 
 if __name__ == "__main__":
-    # ROOT_FOLDER = "./datasets/tokenizer_dataset"
-    ROOT_FOLDER = "./datasets/training_dataset"
+    parser = argparse.ArgumentParser(description="Generate CSV mapping for datasets")
+    parser.add_argument("--root_folder", type=str, required=True, help="Path to the dataset root folder")
+    parser.add_argument("--output_csv", type=str, required=True, help="Path to save the output CSV")
 
-    # generate_dataset_csv(ROOT_FOLDER, output_csv="datasets/tokenizer_dataset_mapping.csv")
-    generate_dataset_csv(ROOT_FOLDER, output_csv="datasets/training_dataset_mapping.csv")
+    args = parser.parse_args()
+
+    generate_dataset_csv(args.root_folder, output_csv=args.output_csv)

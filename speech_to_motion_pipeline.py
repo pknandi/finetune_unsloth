@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse  # Added for command-line arguments
+
 # 1. FIXED: Unsloth imported FIRST to apply optimizations and avoid the warning
 from unsloth import FastLanguageModel
 
@@ -377,20 +379,6 @@ def debug_example(
     return active
 
 
-# def debug_example(example, tokenizer, max_length=4096):
-#     # Call your actual training encoder so we see exactly what the model sees
-#     enc = encode_for_training(example, tokenizer, max_length=max_length)
-
-#     input_ids = enc["input_ids"]
-#     labels = enc["labels"]
-
-#     # Count how many tokens are NOT masked out by -100
-#     active = sum(x != -100 for x in labels)
-
-#     print(f"seq len: {len(input_ids)} | active label tokens: {active}")
-#     return active
-
-
 # =========================
 # 6) Fine-tuning with Unsloth
 # =========================
@@ -404,6 +392,9 @@ def finetune(
     prompt_max_length: int = 2048,
     completion_max_length: int = 6144,
     load_in_4bit: bool = True,
+    max_steps: int = 2000,
+    logging_steps: int = 5,
+    save_steps: int = 1000,
 ):
     # Initialize the W&B run
     wandb.init(project="speech-to-motion", name="orpheus-3b-finetune")
@@ -453,9 +444,9 @@ def finetune(
         gradient_accumulation_steps=4,
         learning_rate=2e-4,
         warmup_steps=10,
-        max_steps=2000,
-        logging_steps=5,
-        save_steps=1000,
+        max_steps=max_steps,
+        logging_steps=logging_steps,
+        save_steps=save_steps,
         bf16=torch.cuda.is_available(),
         fp16=not torch.cuda.is_available(),
         optim="adamw_torch",
@@ -485,23 +476,58 @@ def finetune(
 # 7) Example usage
 # =========================
 if __name__ == "__main__":
-    # 1) Build joint JSONL:
-    # build_joint_jsonl(
-    #     csv_path="datasets/training_dataset_mapping.csv",
-    #     motion_tokenizer_path="motion_tokenizer_artifacts/tokenizer.pkl",
-    #     normalizer_path="motion_tokenizer_artifacts/normalizer.npz",
-    #     output_jsonl="datasets/speech_motion_train.jsonl",
-    #     audio_bandwidth=6.0,
-    # )
+    parser = argparse.ArgumentParser(description="Speech to Motion Fine-Tuning Pipeline")
 
-    # 2) Finetune:
-    finetune(
-        base_model_name="unsloth/orpheus-3b-0.1-pretrained",
-        train_jsonl="datasets/speech_motion_train.jsonl",
-        output_dir="speech_motion_outputs",
-        max_seq_length=8192,
-        prompt_max_length=3072,
-        completion_max_length=5120,
-        load_in_4bit=True,
-    )
-    pass
+    # Flags to control which parts of the pipeline run
+    parser.add_argument("--build_dataset", action="store_true", help="Process audio/motion into a JSONL dataset")
+    parser.add_argument("--train", action="store_true", help="Run the Unsloth fine-tuning process")
+
+    # Paths and configurations (with your defaults)
+    parser.add_argument("--csv_path", type=str, default="datasets/training_dataset_mapping.csv")
+    parser.add_argument("--tokenizer_path", type=str, default="motion_tokenizer_artifacts/tokenizer.pkl")
+    parser.add_argument("--normalizer_path", type=str, default="motion_tokenizer_artifacts/normalizer.npz")
+    parser.add_argument("--output_jsonl", type=str, default="datasets/speech_motion_train.jsonl")
+    parser.add_argument("--output_dir", type=str, default="speech_motion_outputs")
+    parser.add_argument("--base_model", type=str, default="unsloth/orpheus-3b-0.1-pretrained")
+
+    # Add the hyperparameter arguments here:
+    parser.add_argument("--max_steps", type=int, default=2000, help="Total number of training steps")
+    parser.add_argument("--logging_steps", type=int, default=5, help="Log metrics to W&B every X steps")
+    parser.add_argument("--save_steps", type=int, default=1000, help="Save a model checkpoint every X steps")
+
+    args = parser.parse_args()
+
+    # If neither flag is passed, print a helpful message
+    if not args.build_dataset and not args.train:
+        print("Please specify a step to run using --build_dataset or --train (or both).")
+        parser.print_help()
+        exit()
+
+    # 1) Build joint JSONL
+    if args.build_dataset:
+        print("--- Step 1: Building Joint JSONL Dataset ---")
+        build_joint_jsonl(
+            csv_path=args.csv_path,
+            motion_tokenizer_path=args.tokenizer_path,
+            normalizer_path=args.normalizer_path,
+            output_jsonl=args.output_jsonl,
+            audio_bandwidth=6.0,
+        )
+        print(f"Dataset successfully saved to {args.output_jsonl}\n")
+
+    # 2) Finetune
+    if args.train:
+        print("--- Step 2: Starting Unsloth Fine-Tuning ---")
+        finetune(
+            base_model_name=args.base_model,
+            train_jsonl=args.output_jsonl,
+            output_dir=args.output_dir,
+            max_seq_length=8192,
+            prompt_max_length=3072,
+            completion_max_length=5120,
+            load_in_4bit=True,
+            max_steps=args.max_steps,
+            logging_steps=args.logging_steps,
+            save_steps=args.save_steps,
+        )
+        print("Fine-tuning complete!")

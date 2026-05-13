@@ -218,7 +218,7 @@ server.pid
 package-lock.json
 
 # custom
-speech_motion_outputs/
+speech_motion_outputs*/
 
 _unsloth*
 models/
@@ -227,7 +227,7 @@ exported_meshes/
 *.mp4
 *.npy
 inference_data/
-motion_tokenizer_artifacts/
+motion_tokenizer_artifacts*/
 *.csv
 *.jsonl
 wandb/

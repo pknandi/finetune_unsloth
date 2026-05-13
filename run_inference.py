@@ -142,11 +142,26 @@ def generate_motion_from_audio(audio_path: str, lora_model_dir: str, tokenizer_p
 
 
 if __name__ == "__main__":
-    audio_file_name = "c--20250122--1350--ZPZ640--HXR046--FGI958--DLF703--pilot--MotionPrior--DAYLIFE_Doing_chores_together--186171-190520.wav"
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(description="Run Speech-to-Motion Inference")
+
+    parser.add_argument("--audio_path", type=str, required=True, help="Path to the input test audio .wav file")
+    parser.add_argument("--lora_model_dir", type=str, default="speech_motion_outputs/lora", help="Path to the trained LoRA adapters")
+    parser.add_argument("--tokenizer_path", type=str, default="motion_tokenizer_artifacts/tokenizer.pkl")
+    parser.add_argument("--normalizer_path", type=str, default="motion_tokenizer_artifacts/normalizer.npz")
+    parser.add_argument("--output_npy_path", type=str, required=True, help="Path to save the generated motion .npy file")
+
+    args = parser.parse_args()
+
+    # Automatically create the output directory if it doesn't exist
+    os.makedirs(os.path.dirname(args.output_npy_path), exist_ok=True)
+
     generate_motion_from_audio(
-        audio_path=f"inference_data/input/{audio_file_name}",
-        lora_model_dir="speech_motion_outputs/lora",
-        tokenizer_path="motion_tokenizer_artifacts/tokenizer.pkl",
-        normalizer_path="motion_tokenizer_artifacts/normalizer.npz",
-        output_npy_path=f"inference_data/output/generated_motion_{audio_file_name.split('.')[0]}.npy",
+        audio_path=args.audio_path,
+        lora_model_dir=args.lora_model_dir,
+        tokenizer_path=args.tokenizer_path,
+        normalizer_path=args.normalizer_path,
+        output_npy_path=args.output_npy_path,
     )

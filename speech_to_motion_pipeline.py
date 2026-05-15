@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ''
+
 import argparse  # Added for command-line arguments
 
 # 1. FIXED: Unsloth imported FIRST to apply optimizations and avoid the warning
@@ -27,6 +30,9 @@ from encodec.utils import convert_audio
 from sklearn.cluster import MiniBatchKMeans
 from transformers import TrainingArguments, Trainer, default_data_collator
 
+# RUN_NAME = "run-three"
+# BASE_OUTPUT_DIR = Path("./outputs") / RUN_NAME
+# BASE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # =========================
 # 1) SMPL-X motion loading
@@ -395,7 +401,24 @@ def finetune(
     max_steps: int = 2000,
     logging_steps: int = 5,
     save_steps: int = 1000,
+    resume_from_checkpoint: str | Path | None = None,
 ):
+    # Resolve checkpoint to resume from
+    resume_ckpt = None
+    if resume_from_checkpoint is not None:
+        resume_ckpt = str(resume_from_checkpoint)
+        print(f"Resuming from specified checkpoint: {resume_ckpt}")
+    else:
+        ckpt_dirs = sorted(
+            [d for d in Path(output_dir).glob("checkpoint-*") if d.is_dir()],
+            key=lambda d: int(d.name.split("-")[-1]),
+        )
+        if ckpt_dirs:
+            resume_ckpt = str(ckpt_dirs[-1])
+            print(f"Auto-resuming from latest checkpoint: {resume_ckpt}")
+        else:
+            print("No checkpoints found — starting fresh.")
+
     # Initialize the W&B run
     wandb.init(project="speech-to-motion", name="orpheus-3b-finetune")
 
@@ -412,12 +435,12 @@ def finetune(
 
     model = FastLanguageModel.get_peft_model(
         model,
-        r=16,
+        r=32,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=16,
+        lora_alpha=64,
         lora_dropout=0.0,
         bias="none",
-        use_gradient_checkpointing="unsloth",
+        use_gradient_checkpointing=True,
         random_state=3407,
         modules_to_save=["embed_tokens", "lm_head"],
     )
@@ -441,7 +464,7 @@ def finetune(
     args = TrainingArguments(
         output_dir=str(output_dir),
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=8,
         learning_rate=2e-4,
         warmup_steps=10,
         max_steps=max_steps,
@@ -463,7 +486,7 @@ def finetune(
         data_collator=default_data_collator,
     )
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_ckpt)
 
     model.save_pretrained(str(Path(output_dir) / "lora"))
     tokenizer.save_pretrained(str(Path(output_dir) / "lora"))
@@ -494,6 +517,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_steps", type=int, default=2000, help="Total number of training steps")
     parser.add_argument("--logging_steps", type=int, default=5, help="Log metrics to W&B every X steps")
     parser.add_argument("--save_steps", type=int, default=1000, help="Save a model checkpoint every X steps")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a specific checkpoint to resume from. If omitted, auto-detects the latest checkpoint in --output_dir.")
 
     args = parser.parse_args()
 
@@ -529,5 +553,6 @@ if __name__ == "__main__":
             max_steps=args.max_steps,
             logging_steps=args.logging_steps,
             save_steps=args.save_steps,
+            resume_from_checkpoint=args.resume_from_checkpoint,
         )
         print("Fine-tuning complete!")

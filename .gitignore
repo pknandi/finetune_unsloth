@@ -220,6 +220,7 @@ package-lock.json
 # custom
 speech_motion_outputs*/
 
+speech_motion_outputs/
 _unsloth*
 models/
 speech_motion_train.jsonl
@@ -231,3 +232,6 @@ motion_tokenizer_artifacts*/
 *.csv
 *.jsonl
 wandb/
+Motion_speech_project/**
+tmux_log*
+outputs

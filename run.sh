@@ -6,7 +6,7 @@ set -e
 # ==========================================
 # EXPORTS
 # ==========================================
-export CUDA_VISIBLE_DEVICES=1
+# export CUDA_VISIBLE_DEVICES=1
 
 ENV_FILE="${ENV_FILE:-.env}"
 
@@ -31,7 +31,7 @@ echo "Running with STAGE=$STAGE STOP_STAGE=$STOP_STAGE"
 # ==========================================
 # RUN + LOGGING
 # ==========================================
-RUN_NAME="run-may13"
+RUN_NAME="run-may21"
 
 LOG_DIR="./outputs/terminal"
 LOG_FILE="$LOG_DIR/$(date '+%Y-%m-%d_%H-%M-%S').log"
@@ -58,7 +58,7 @@ NC='\033[0m' # No color
 # TOKENIZER CONFIG
 # ==========================================
 
-TOK_ROOT_FOLDER="./Motion_speech_project/tokenizer_data"              # Tokenizer training dataset
+TOK_ROOT_FOLDER="./datasets/tokenizer_dataset_may13"              # Tokenizer training dataset
 TOK_CSV="./outputs/$RUN_NAME/tokenizer_dataset_mapping.csv"          # audio_filename,motion_dirname
 TOK_SAVE_DIR="./outputs/$RUN_NAME/motion_tokenizer_artifacts"        # tokenizer.pkl + normalizer.npz
 
@@ -68,7 +68,7 @@ N_CLUSTERS=1024                                                       # Motion t
 # TRAINING CONFIG
 # ==========================================
 
-TRAIN_ROOT_FOLDER="./Motion_speech_project/tokenizer_data"           # LLM training dataset
+TRAIN_ROOT_FOLDER="./datasets/training_dataset_may13"           # LLM training dataset
 TRAIN_CSV="./outputs/$RUN_NAME/training_dataset_mapping.csv"         # Training dataset CSV
 TRAIN_JSONL="./outputs/$RUN_NAME/speech_motion_train.jsonl"          # Final tokenized dataset
 
@@ -80,9 +80,9 @@ RESUME_CHECKPOINT="" #"./outputs/$RUN_NAME/lora/checkpoint-2500"
 # TRAINING HYPERPARAMETERS
 # ==========================================
 
-MAX_STEPS=10000
+MAX_STEPS=30000
 LOGGING_STEPS=5
-SAVE_STEPS=2500
+SAVE_STEPS=10000
 
 # ==========================================
 # INFERENCE CONFIG
@@ -90,7 +90,7 @@ SAVE_STEPS=2500
 
 AUDIO_FILE_NAME="c--20250108--1300--DXG448--SZM479--JON169--BWW760--pilot--MotionPrior--ACTING_Adult_Birthday_--103301-106600.wav"  # Just the filename, not full path
 AUDIO_BASENAME=$(basename "$AUDIO_FILE_NAME" .wav)                   # abc.wav -> abc
-INFERENCE_AUDIO="/home/mubtasim/speech-motion/Motion_speech_project/motion_speech_dataset/audio/c--20250108--1300--DXG448--SZM479--JON169--BWW760--pilot--MotionPrior--ACTING_Adult_Birthday_--103301-106600/BWW760/audio_separated/c--20250108--1300--DXG448--SZM479--JON169--BWW760--pilot--MotionPrior--ACTING_Adult_Birthday_--103301-106600.wav"
+INFERENCE_AUDIO="inference_data/input/c--20250122--1350--ZPZ640--HXR046--FGI958--DLF703--pilot--MotionPrior--DAYLIFE_Doing_chores_together--186171-190520.wav"
 INFERECE_CHECKPOINT="./outputs/$RUN_NAME/lora/checkpoint-2500"
 INFERENCE_OUTPUT="./outputs/$RUN_NAME/inference/generated_motion_${RUN_NAME}_$(echo "$BASE_MODEL" | sed 's/[^a-zA-Z0-9]/_/g' | sed 's/_\+/_/g' | sed 's/^_\|_$//g')_${AUDIO_BASENAME}.npy"
 INFERENCE_VIDEO="./outputs/$RUN_NAME/inference/video_${RUN_NAME}_$(echo "$BASE_MODEL" | sed 's/[^a-zA-Z0-9]/_/g' | sed 's/_\+/_/g' | sed 's/^_\|_$//g')_${AUDIO_BASENAME}.mp4"
@@ -156,6 +156,11 @@ fi
 if [ "$STAGE" -le 5 ] && [ "$STOP_STAGE" -ge 5 ]; then
     echo -e "\n${YELLOW}=> [5/6] Starting Unsloth LoRA Fine-Tuning...${NC}"
 
+    RESUME_FLAG=""
+    if [ -n "$RESUME_CHECKPOINT" ]; then
+        RESUME_FLAG="--resume_from_checkpoint $RESUME_CHECKPOINT"
+    fi
+
     python3 speech_to_motion_pipeline.py --train \
         --output_jsonl $TRAIN_JSONL \
         --output_dir $OUTPUT_DIR \
@@ -163,7 +168,7 @@ if [ "$STAGE" -le 5 ] && [ "$STOP_STAGE" -ge 5 ]; then
         --max_steps $MAX_STEPS \
         --logging_steps $LOGGING_STEPS \
         --save_steps $SAVE_STEPS \
-        --resume_from_checkpoint $RESUME_CHECKPOINT
+        $RESUME_FLAG
 fi
 
 # ---------------------------------------------------------

@@ -8,7 +8,6 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from pathlib import Path
 import argparse
-import os
 
 
 def render_motion(npy_path: str, smplx_model_dir: str, output_path: str = None):
@@ -23,23 +22,11 @@ def render_motion(npy_path: str, smplx_model_dir: str, output_path: str = None):
     transl = torch.FloatTensor(motion[:, 156:159])
 
     print("2. Loading SMPL-X Body Model...")
-    model = smplx.create(
-        model_path=smplx_model_dir,
-        model_type="smplx",
-        gender="neutral",
-        use_pca=False,
-        batch_size=num_frames
-    )
+    model = smplx.create(model_path=smplx_model_dir, model_type="smplx", gender="neutral", use_pca=False, batch_size=num_frames)
 
     print("3. Forward Kinematics...")
     with torch.no_grad():
-        output = model(
-            global_orient=global_orient,
-            body_pose=body_pose,
-            left_hand_pose=left_hand,
-            right_hand_pose=right_hand,
-            transl=transl
-        )
+        output = model(global_orient=global_orient, body_pose=body_pose, left_hand_pose=left_hand, right_hand_pose=right_hand, transl=transl)
 
     joints = output.joints.numpy()
     vertices = output.vertices.numpy()
@@ -109,8 +96,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    render_motion(
-            npy_path=args.npy_path,
-            smplx_model_dir=args.smplx_model_dir,
-            output_path=args.output_path
-    )
+    render_motion(npy_path=args.npy_path, smplx_model_dir=args.smplx_model_dir, output_path=args.output_path)

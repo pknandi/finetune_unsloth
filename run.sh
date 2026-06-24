@@ -73,7 +73,7 @@ TRAIN_CSV="./outputs/$RUN_NAME/training_dataset_mapping.csv"         # Training 
 TRAIN_JSONL="./outputs/$RUN_NAME/speech_motion_train.jsonl"          # Final tokenized dataset
 
 OUTPUT_DIR="./outputs/$RUN_NAME/lora"                                # LoRA checkpoints
-BASE_MODEL="unsloth/orpheus-3b-0.1-pretrained" #"unsloth/llama-3-8b-bnb-4bit"                             # Base model
+BASE_MODEL="unsloth/llama-3-8b-bnb-4bit"                             # Base model
 RESUME_CHECKPOINT="" #"./outputs/$RUN_NAME/lora/checkpoint-2500"
 
 # ==========================================
@@ -95,6 +95,11 @@ INFERECE_CHECKPOINT="./outputs/$RUN_NAME/lora/checkpoint-2500"
 INFERENCE_OUTPUT="./outputs/$RUN_NAME/inference/generated_motion_${RUN_NAME}_$(echo "$BASE_MODEL" | sed 's/[^a-zA-Z0-9]/_/g' | sed 's/_\+/_/g' | sed 's/^_\|_$//g')_${AUDIO_BASENAME}.npy"
 INFERENCE_VIDEO="./outputs/$RUN_NAME/inference/video_${RUN_NAME}_$(echo "$BASE_MODEL" | sed 's/[^a-zA-Z0-9]/_/g' | sed 's/_\+/_/g' | sed 's/^_\|_$//g')_${AUDIO_BASENAME}.mp4"
 SMPLX_MODEL_DIR="./outputs/smplx/models"
+
+# Ground truth: session dir (contains BWW760, DXG448, etc. sub-dirs) + subject
+GT_SESSION_DIR="./Motion_speech_project/motion_speech_dataset/smplx/c--20250108--1300--DXG448--SZM479--JON169--BWW760--pilot--MotionPrior--ACTING_Adult_Birthday_--103301-106600"
+GT_SUBJECT="BWW760"
+COMPARISON_VIDEO="./outputs/$RUN_NAME/inference/comparison_${RUN_NAME}_${BASE_MODEL_SLUG}_${AUDIO_BASENAME}.mp4"
 
 
 #################################################################################################################
@@ -191,15 +196,46 @@ if [ "$STAGE" -le 6 ] && [ "$STOP_STAGE" -ge 6 ]; then
 fi
 
 # ---------------------------------------------------------
-# STEP 7: Visualization (SMPL-X render + mp4 + obj export)
+# STEP 7: Visualization (predicted motion only)
 # ---------------------------------------------------------
 if [ "$STAGE" -le 7 ] && [ "$STOP_STAGE" -ge 7 ]; then
-    echo -e "\n${CYAN}=> [7/7] Rendering SMPL-X Motion Visualization...${NC}"
-
+    echo -e "\n${CYAN}=> [7/8] Rendering SMPL-X Motion Visualization...${NC}"
+ 
     python3 visualize_motion.py \
-        --npy_path $INFERENCE_OUTPUT \
-        --smplx_model_dir $SMPLX_MODEL_DIR \
-        --output_path $INFERENCE_VIDEO \
+        --npy_path        "$INFERENCE_OUTPUT" \
+        --smplx_model_dir "$SMPLX_MODEL_DIR" \
+        --output_path     "$INFERENCE_VIDEO"
+ 
+    echo -e "\n${GREEN}=> Visualization complete: $INFERENCE_VIDEO${NC}"
+fi
 
-    echo -e "\n${GREEN}=> Visualization complete${NC}"
+
+# ---------------------------------------------------------
+# STEP 8: Side-by-side GT vs Predicted Comparison Video
+# ---------------------------------------------------------
+if [ "$STAGE" -le 8 ] && [ "$STOP_STAGE" -ge 8 ]; then
+    echo -e "\n${CYAN}=> [8/8] Rendering GT vs Predicted Comparison Video...${NC}"
+
+    # Diagnostics first — prints frame counts, no rendering
+    echo -e "${YELLOW}  -- Diagnostics --${NC}"
+    python3 compare_motion.py --diagnose \
+        --session_dir "$GT_SESSION_DIR" \
+        --subject     "$GT_SUBJECT" \
+        --pred_npy    "$INFERENCE_OUTPUT"
+
+    # Render side-by-side
+    python3 compare_motion.py \
+        --session_dir "$GT_SESSION_DIR" \
+        --subject     "$GT_SUBJECT" \
+        --pred_npy    "$INFERENCE_OUTPUT" \
+        --audio_path  "$INFERENCE_AUDIO" \
+        --output_path "$COMPARISON_VIDEO" \
+        --fps         30 \
+        --max_seconds 10.0 \
+        --width       1280 \
+        --height      540 \
+        --elev        15 \
+        --azim        -60
+
+    echo -e "\n${GREEN}=> Comparison video: $COMPARISON_VIDEO${NC}"
 fi

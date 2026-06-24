@@ -232,6 +232,6 @@ motion_tokenizer_artifacts*/
 *.csv
 *.jsonl
 wandb/
-Motion_speech_project/**
+Motion_speech_project**
 tmux_log*
 outputs

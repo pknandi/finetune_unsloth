@@ -1,231 +1,46 @@
 # speech_to_motion_pipeline.py
 
 from __future__ import annotations
-
 import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ''
 
-import argparse  # Added for command-line arguments
-
-# 1. FIXED: Unsloth imported FIRST to apply optimizations and avoid the warning
-from unsloth import FastLanguageModel
-
-import soundfile as sf
-
+import argparse
 import json
 from pathlib import Path
-from typing import List, Optional
-
-import joblib
 import numpy as np
 import pandas as pd
 import torch
-
 import wandb
+import soundfile as sf
 
-# 2. FIXED: Imported from standalone 'encodec' instead of 'audiocraft'
+from unsloth import FastLanguageModel
 from encodec import EncodecModel
 from encodec.utils import convert_audio
-
-from sklearn.cluster import MiniBatchKMeans
 from transformers import TrainingArguments, Trainer, default_data_collator
 
-# RUN_NAME = "run-three"
-# BASE_OUTPUT_DIR = Path("./outputs") / RUN_NAME
-# BASE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# IMPORT THE NEW ARCHITECTURE
+from vqvae_motion_tokenizer import VQVAETokenizer, Normalizer, load_smplx_sequence, preprocess_motion
 
 # =========================
-# 1) SMPL-X motion loading
+# 1) Audio tokenization with EnCodec
 # =========================
-
-SMPLX_PARTS = [
-    "smplx_mesh_global_orient",
-    "smplx_mesh_body_pose",
-    "smplx_mesh_left_hand_pose",
-    "smplx_mesh_right_hand_pose",
-    "smplx_mesh_transl",
-]
-
-
-def _load_single_npy_from_folder(folder: Path, expected_stem: Optional[str] = None) -> np.ndarray:
-    npy_files = sorted(folder.glob("*.npy"))
-    if not npy_files:
-        raise FileNotFoundError(f"No .npy files found in {folder}")
-
-    if expected_stem is not None:
-        for f in npy_files:
-            if f.stem == expected_stem:
-                return np.load(f, allow_pickle=False)
-
-    return np.load(npy_files[0], allow_pickle=False)
-
-
-def _ensure_2d_frame_major(arr: np.ndarray, seq_len: int) -> np.ndarray:
-    arr = np.asarray(arr)
-    if arr.ndim == 1:
-        return np.repeat(arr[None, :], seq_len, axis=0)
-    if arr.shape[0] == seq_len:
-        return arr.reshape(seq_len, -1)
-    if arr.shape[0] == 1:
-        return np.repeat(arr, seq_len, axis=0).reshape(seq_len, -1)
-    raise ValueError(f"Cannot align array {arr.shape} to length {seq_len}")
-
-
-def load_smplx_sequence(motion_dirname: str | Path, include_betas: bool = False) -> np.ndarray:
-    motion_dir = Path(motion_dirname)
-    expected_stem = motion_dir.parent.name
-
-    parts = list(SMPLX_PARTS)
-    if include_betas:
-        parts.append("smplx_mesh_betas")
-
-    arrays = {}
-    for part in parts:
-        part_dir = motion_dir / part
-        if part_dir.exists():
-            arrays[part] = _load_single_npy_from_folder(part_dir, expected_stem=expected_stem)
-
-    if not arrays:
-        raise FileNotFoundError(f"No SMPL-X files found in {motion_dir}")
-
-    T = min(arr.shape[0] for arr in arrays.values())
-    blocks = []
-
-    for part in parts:
-        arr = arrays.get(part)
-        if arr is None:
-            if part == "smplx_mesh_global_orient":
-                block = np.zeros((T, 3), dtype=np.float32)
-            elif part == "smplx_mesh_body_pose":
-                block = np.zeros((T, 63), dtype=np.float32)
-            elif part in ("smplx_mesh_left_hand_pose", "smplx_mesh_right_hand_pose"):
-                block = np.zeros((T, 45), dtype=np.float32)
-            elif part == "smplx_mesh_transl":
-                block = np.zeros((T, 3), dtype=np.float32)
-            elif part == "smplx_mesh_betas":
-                block = np.zeros((T, 10), dtype=np.float32)
-            else:
-                continue
-        else:
-            block = _ensure_2d_frame_major(arr, T).astype(np.float32)
-            if part == "smplx_mesh_betas" and block.shape[0] != T:
-                block = np.repeat(block[:1], T, axis=0)
-
-        blocks.append(block[:T])
-
-    return np.concatenate(blocks, axis=-1)
-
-
-def preprocess_motion(motion: np.ndarray) -> np.ndarray:
-    global_orient = motion[:, :3]
-    body = motion[:, 3:66]
-    left_hand = motion[:, 66:111]
-    right_hand = motion[:, 111:156]
-    transl = motion[:, 156:159]
-
-    transl_vel = np.zeros_like(transl)
-    transl_vel[1:] = transl[1:] - transl[:-1]
-
-    return np.concatenate([global_orient, body, left_hand, right_hand, transl_vel], axis=-1).astype(np.float32)
-
-
-# =========================
-# 2) Motion tokenizer
-# =========================
-
-
-class Normalizer:
-    def __init__(self):
-        self.mean = None
-        self.std = None
-
-    def fit(self, data: np.ndarray):
-        self.mean = data.mean(axis=0, keepdims=True)
-        self.std = data.std(axis=0, keepdims=True) + 1e-6
-
-    def transform(self, data: np.ndarray) -> np.ndarray:
-        if self.mean is None or self.std is None:
-            raise RuntimeError("Normalizer not fitted.")
-        return (data - self.mean) / self.std
-
-    def save(self, path: str | Path):
-        np.savez(path, mean=self.mean, std=self.std)
-
-    def load(self, path: str | Path):
-        d = np.load(path)
-        self.mean = d["mean"]
-        self.std = d["std"]
-
-
-class MotionTokenizer:
-    def __init__(self, n_clusters: int = 1024):
-        self.kmeans = MiniBatchKMeans(
-            n_clusters=n_clusters,
-            batch_size=4096,
-            random_state=42,
-            n_init="auto",
-            verbose=1,
-        )
-
-    def fit(self, data: np.ndarray):
-        self.kmeans.fit(data)
-
-    def encode(self, motion: np.ndarray) -> np.ndarray:
-        return self.kmeans.predict(motion).astype(np.int32)
-
-    def save(self, path: str | Path):
-        joblib.dump(self.kmeans, path)
-
-    def load(self, path: str | Path):
-        self.kmeans = joblib.load(path)
-
-
-def load_motion_tokenizer(tokenizer_path: str | Path, normalizer_path: str | Path):
-    motion_tok = MotionTokenizer()
-    motion_tok.load(tokenizer_path)
-    norm = Normalizer()
-    norm.load(normalizer_path)
-    return motion_tok, norm
-
-
-def encode_motion_from_dir(motion_dirname: str | Path, motion_tokenizer: MotionTokenizer, norm: Normalizer) -> np.ndarray:
-    motion = load_smplx_sequence(motion_dirname, include_betas=False)
-    motion = preprocess_motion(motion)
-    motion = norm.transform(motion)
-    return motion_tokenizer.encode(motion)
-
-
-# =========================
-# 3) Audio tokenization with EnCodec
-# =========================
-
-
 def tokenize_audio_encodec(audio_path: str | Path, bandwidth: float = 6.0) -> np.ndarray:
-    """
-    Returns:
-        codes: [n_q, T]
-    """
     model = EncodecModel.encodec_model_24khz()
     model.set_target_bandwidth(bandwidth)
 
-    # BULLETPROOF FIX: Use soundfile directly instead of torchaudio
     wav_np, sr = sf.read(str(audio_path), dtype="float32")
-
-    # Soundfile loads as (frames, channels), PyTorch expects (channels, frames)
     wav = torch.from_numpy(wav_np).t()
     if wav.ndim == 1:
         wav = wav.unsqueeze(0)
 
-    # Convert audio to Encodec's expected sample rate and channels
     wav = convert_audio(wav, sr, model.sample_rate, model.channels)
     wav = wav.unsqueeze(0)
 
     with torch.no_grad():
         encoded_frames = model.encode(wav)
 
-    codes = torch.cat([frame[0] for frame in encoded_frames], dim=-1)  # [B, n_q, T]
+    codes = torch.cat([frame[0] for frame in encoded_frames], dim=-1)
     return codes.squeeze(0).cpu().numpy().astype(np.int32)
-
 
 def audio_tokens_to_text(codes: np.ndarray) -> str:
     n_q, T = codes.shape
@@ -233,70 +48,69 @@ def audio_tokens_to_text(codes: np.ndarray) -> str:
     for t in range(T):
         for q in range(n_q):
             parts.append(f"<a_{q}_{int(codes[q, t])}>")
-    return " ".join(parts)
-
+    return "".join(parts) # NO SPACES
 
 def motion_tokens_to_text(tokens: np.ndarray) -> str:
-    return " ".join(f"<m_{int(t)}>" for t in tokens.reshape(-1))
-
-
-def build_text_row(audio_tokens: str, motion_tokens: str) -> str:
-    return f"<|audio|> {audio_tokens} <|motion|> {motion_tokens}"
-
+    return "".join(f"<m_{int(t)}>" for t in tokens.reshape(-1)) # NO SPACES
 
 # =========================
-# 4) Build training JSONL
+# 2) Build training JSONL
 # =========================
-
-
 def build_joint_jsonl(
     csv_path: str | Path,
-    motion_tokenizer_path: str | Path,
+    tokenizer_path: str | Path,
     normalizer_path: str | Path,
     output_jsonl: str | Path,
     audio_bandwidth: float = 6.0,
+    max_duration_sec: float = 10.0,
 ):
     df = pd.read_csv(csv_path)
-    motion_tok, norm = load_motion_tokenizer(motion_tokenizer_path, normalizer_path)
+    
+    motion_tok = VQVAETokenizer()
+    motion_tok.load(tokenizer_path)
+    norm = Normalizer()
+    norm.load(normalizer_path)
 
     output_jsonl = Path(output_jsonl)
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
+    audio_fps = 75
+    motion_fps = 7.5 # VQVAE 4x Compression (30 / 4)
+
     with output_jsonl.open("w", encoding="utf-8") as f:
         for i, row in df.iterrows():
-            audio_path = row["audio_filename"]
-            motion_dir = row["motion_dirname"]
-
             try:
-                audio_codes = tokenize_audio_encodec(audio_path, bandwidth=audio_bandwidth)
-                motion_codes = encode_motion_from_dir(motion_dir, motion_tok, norm)
+                audio_codes = tokenize_audio_encodec(row["audio_filename"], bandwidth=audio_bandwidth)
+                
+                motion = load_smplx_sequence(row["motion_dirname"])
+                motion = preprocess_motion(motion)
+                motion = norm.transform(motion)
+                motion_codes = motion_tok.encode(motion)
+
+                # Exact 10:1 Temporal Alignment Math
+                actual_audio_sec = audio_codes.shape[1] / audio_fps
+                actual_motion_sec = motion_codes.shape[0] / motion_fps
+                valid_sec = min(actual_audio_sec, actual_motion_sec, max_duration_sec)
+                
+                raw_a_frames = int(valid_sec * audio_fps)
+                max_a_frames = (raw_a_frames // 10) * 10 
+                max_m_frames = max_a_frames // 10
+                
+                audio_codes = audio_codes[:, :max_a_frames]
+                motion_codes = motion_codes[:max_m_frames]
 
                 sample = {
                     "id": str(i),
-                    "audio_filename": audio_path,
-                    "motion_dirname": motion_dir,
-                    "prompt": audio_tokens_to_text(audio_codes),
+                    "prompt": f"<|audio|>{audio_tokens_to_text(audio_codes)}<|motion|>",
                     "completion": motion_tokens_to_text(motion_codes),
                 }
                 f.write(json.dumps(sample, ensure_ascii=False) + "\n")
             except Exception as e:
                 print(f"Skipping row {i}: {e}")
 
-
 # =========================
-# 5) Training token prep
+# 3) Training prep & Debug
 # =========================
-
-
-def _find_subsequence(seq: List[int], subseq: List[int]) -> int:
-    if not subseq or len(subseq) > len(seq):
-        return -1
-    for i in range(len(seq) - len(subseq) + 1):
-        if seq[i : i + len(subseq)] == subseq:
-            return i
-    return -1
-
-
 def add_discrete_tokens(tokenizer, audio_codebook_size=1024, audio_num_codebooks=8, motion_vocab_size=1024):
     special = ["<|audio|>", "<|motion|>"]
     special += [f"<a_{q}_{i}>" for q in range(audio_num_codebooks) for i in range(audio_codebook_size)]
@@ -306,27 +120,12 @@ def add_discrete_tokens(tokenizer, audio_codebook_size=1024, audio_num_codebooks
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
 
+def encode_for_training(example, tokenizer, max_seq_length=8192):
+    prompt_ids = tokenizer(example["prompt"], add_special_tokens=True, truncation=True, max_length=7000)["input_ids"]
+    completion_ids = tokenizer(example["completion"], add_special_tokens=False, truncation=True, max_length=1000)["input_ids"]
 
-def encode_for_training(
-    example,
-    tokenizer,
-    max_seq_length=8192,
-    prompt_max_length=2048,
-    completion_max_length=6144,
-):
-    prompt_ids = tokenizer(
-        example["prompt"],
-        add_special_tokens=True,
-        truncation=True,
-        max_length=prompt_max_length,
-    )["input_ids"]
-
-    completion_ids = tokenizer(
-        example["completion"],
-        add_special_tokens=False,
-        truncation=True,
-        max_length=completion_max_length,
-    )["input_ids"]
+    if len(completion_ids) > 0 and completion_ids[-1] != tokenizer.eos_token_id:
+        completion_ids.append(tokenizer.eos_token_id)
 
     input_ids = prompt_ids + completion_ids
     labels = [-100] * len(prompt_ids) + completion_ids
@@ -336,39 +135,14 @@ def encode_for_training(
         labels = labels[:max_seq_length]
 
     active = sum(x != -100 for x in labels)
-    return {
-        "input_ids": input_ids,
-        "attention_mask": [1] * len(input_ids),
-        "labels": labels,
-        "active_label_tokens": active,
-    }
+    return {"input_ids": input_ids, "attention_mask": [1]*len(input_ids), "labels": labels, "active_label_tokens": active}
 
-
-# =========================
-# 6) Debugging utilities
-# =========================
-
-
-def debug_example(
-    example,
-    tokenizer,
-    max_seq_length=8192,
-    prompt_max_length=2048,
-    completion_max_length=6144,
-):
-    prompt_ids = tokenizer(
-        example["prompt"],
-        add_special_tokens=True,
-        truncation=True,
-        max_length=prompt_max_length,
-    )["input_ids"]
-
-    completion_ids = tokenizer(
-        example["completion"],
-        add_special_tokens=False,
-        truncation=True,
-        max_length=completion_max_length,
-    )["input_ids"]
+def debug_example(example, tokenizer, max_seq_length=8192):
+    prompt_ids = tokenizer(example["prompt"], add_special_tokens=True, truncation=True, max_length=7000)["input_ids"]
+    completion_ids = tokenizer(example["completion"], add_special_tokens=False, truncation=True, max_length=1000)["input_ids"]
+    
+    if len(completion_ids) > 0 and completion_ids[-1] != tokenizer.eos_token_id:
+        completion_ids.append(tokenizer.eos_token_id)
 
     input_ids = prompt_ids + completion_ids
     labels = [-100] * len(prompt_ids) + completion_ids
@@ -384,26 +158,21 @@ def debug_example(
     print("active label tokens:", active)
     return active
 
-
 # =========================
-# 6) Fine-tuning with Unsloth
+# 4) Fine-tuning
 # =========================
-
-
 def finetune(
     base_model_name: str,
     train_jsonl: str | Path,
     output_dir: str | Path,
     max_seq_length: int = 8192,
-    prompt_max_length: int = 2048,
-    completion_max_length: int = 6144,
     load_in_4bit: bool = True,
     max_steps: int = 2000,
     logging_steps: int = 5,
     save_steps: int = 1000,
     resume_from_checkpoint: str | Path | None = None,
 ):
-    # Resolve checkpoint to resume from
+    # RESTORED: Checkpoint resuming logic
     resume_ckpt = None
     if resume_from_checkpoint is not None:
         resume_ckpt = str(resume_from_checkpoint)
@@ -419,7 +188,7 @@ def finetune(
         else:
             print("No checkpoints found — starting fresh.")
 
-    # Initialize the W&B run
+    # RESTORED: WandB naming
     wandb.init(project="speech-to-motion", name="orpheus-3b-finetune")
 
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -427,132 +196,85 @@ def finetune(
         max_seq_length=max_seq_length,
         load_in_4bit=load_in_4bit,
     )
-
-    # Adjust these if your tokenizer sizes differ.
+    
     tokenizer = add_discrete_tokens(tokenizer)
-
     model.resize_token_embeddings(len(tokenizer))
 
     model = FastLanguageModel.get_peft_model(
-        model,
-        r=32,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=64,
-        lora_dropout=0.0,
-        bias="none",
-        use_gradient_checkpointing=True,
-        random_state=3407,
-        modules_to_save=["embed_tokens", "lm_head"],
+        model, r=32, target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_alpha=64, lora_dropout=0.0, bias="none", use_gradient_checkpointing=True, random_state=3407,
+        modules_to_save=["embed_tokens", "lm_head"]
     )
 
     from datasets import load_dataset
-
     dataset = load_dataset("json", data_files=str(train_jsonl), split="train")
+    
+    # RESTORED: Debug example printing
     for i in range(min(3, len(dataset))):
-        debug_example(
-            dataset[i], tokenizer, max_seq_length=max_seq_length, prompt_max_length=prompt_max_length, completion_max_length=completion_max_length
-        )
-    dataset = dataset.map(
-        lambda ex: encode_for_training(
-            ex, tokenizer, max_seq_length=max_seq_length, prompt_max_length=prompt_max_length, completion_max_length=completion_max_length
-        ),
-        num_proc=2,
-    )
+        debug_example(dataset[i], tokenizer, max_seq_length=max_seq_length)
 
-    print(dataset[0]["active_label_tokens"])
+    dataset = dataset.map(lambda ex: encode_for_training(ex, tokenizer, max_seq_length), num_proc=2)
 
+    # RESTORED: logging_steps, run_name
     args = TrainingArguments(
-        output_dir=str(output_dir),
-        per_device_train_batch_size=1,
+        output_dir=str(output_dir), 
+        per_device_train_batch_size=1, 
         gradient_accumulation_steps=8,
-        learning_rate=2e-4,
-        warmup_steps=10,
-        max_steps=max_steps,
-        logging_steps=logging_steps,
+        learning_rate=2e-4, 
+        warmup_steps=10, 
+        max_steps=max_steps, 
+        logging_steps=logging_steps, # Fixed
         save_steps=save_steps,
-        bf16=torch.cuda.is_available(),
-        fp16=not torch.cuda.is_available(),
+        bf16=torch.cuda.is_available(), 
+        fp16=not torch.cuda.is_available(), 
         optim="adamw_torch",
-        weight_decay=0.01,
-        lr_scheduler_type="cosine",
+        weight_decay=0.01, 
+        lr_scheduler_type="cosine", 
         report_to="wandb",
-        run_name="orpheus-3b-finetune",
+        run_name="orpheus-3b-finetune" # Fixed
     )
 
-    trainer = Trainer(
-        model=model,
-        args=args,
-        train_dataset=dataset,
-        data_collator=default_data_collator,
-    )
-
-    trainer.train(resume_from_checkpoint=resume_ckpt)
+    trainer = Trainer(model=model, args=args, train_dataset=dataset, data_collator=default_data_collator)
+    
+    # RESTORED: pass resume_ckpt to trainer
+    trainer.train(resume_from_checkpoint=resume_ckpt) 
 
     model.save_pretrained(str(Path(output_dir) / "lora"))
     tokenizer.save_pretrained(str(Path(output_dir) / "lora"))
-
-    # Close the W&B run cleanly at the end
     wandb.finish()
 
-
-# =========================
-# 7) Example usage
-# =========================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Speech to Motion Fine-Tuning Pipeline")
-
-    # Flags to control which parts of the pipeline run
-    parser.add_argument("--build_dataset", action="store_true", help="Process audio/motion into a JSONL dataset")
-    parser.add_argument("--train", action="store_true", help="Run the Unsloth fine-tuning process")
-
-    # Paths and configurations (with your defaults)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--build_dataset", action="store_true")
+    parser.add_argument("--train", action="store_true")
     parser.add_argument("--csv_path", type=str, default="datasets/training_dataset_mapping.csv")
-    parser.add_argument("--tokenizer_path", type=str, default="motion_tokenizer_artifacts/tokenizer.pkl")
+    parser.add_argument("--tokenizer_path", type=str, default="motion_tokenizer_artifacts/tokenizer.pt")
     parser.add_argument("--normalizer_path", type=str, default="motion_tokenizer_artifacts/normalizer.npz")
     parser.add_argument("--output_jsonl", type=str, default="datasets/speech_motion_train.jsonl")
     parser.add_argument("--output_dir", type=str, default="speech_motion_outputs")
-    parser.add_argument("--base_model", type=str, default="unsloth/orpheus-3b-0.1-pretrained")
-
-    # Add the hyperparameter arguments here:
-    parser.add_argument("--max_steps", type=int, default=2000, help="Total number of training steps")
+    parser.add_argument("--base_model", type=str, default="unsloth/llama-3-8b-bnb-4bit")
+    parser.add_argument("--max_steps", type=int, default=2000)
+    
+    # RESTORED: logging arguments
     parser.add_argument("--logging_steps", type=int, default=5, help="Log metrics to W&B every X steps")
-    parser.add_argument("--save_steps", type=int, default=1000, help="Save a model checkpoint every X steps")
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a specific checkpoint to resume from. If omitted, auto-detects the latest checkpoint in --output_dir.")
+    parser.add_argument("--save_steps", type=int, default=1000)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a specific checkpoint to resume from.")
 
     args = parser.parse_args()
 
-    # If neither flag is passed, print a helpful message
-    if not args.build_dataset and not args.train:
-        print("Please specify a step to run using --build_dataset or --train (or both).")
-        parser.print_help()
-        exit()
-
-    # 1) Build joint JSONL
     if args.build_dataset:
         print("--- Step 1: Building Joint JSONL Dataset ---")
-        build_joint_jsonl(
-            csv_path=args.csv_path,
-            motion_tokenizer_path=args.tokenizer_path,
-            normalizer_path=args.normalizer_path,
-            output_jsonl=args.output_jsonl,
-            audio_bandwidth=6.0,
-        )
+        build_joint_jsonl(args.csv_path, args.tokenizer_path, args.normalizer_path, args.output_jsonl)
         print(f"Dataset successfully saved to {args.output_jsonl}\n")
-
-    # 2) Finetune
+        
     if args.train:
         print("--- Step 2: Starting Unsloth Fine-Tuning ---")
         finetune(
-            base_model_name=args.base_model,
-            train_jsonl=args.output_jsonl,
-            output_dir=args.output_dir,
-            max_seq_length=8192,
-            prompt_max_length=3072,
-            completion_max_length=5120,
-            load_in_4bit=True,
-            max_steps=args.max_steps,
+            base_model_name=args.base_model, 
+            train_jsonl=args.output_jsonl, 
+            output_dir=args.output_dir, 
+            max_steps=args.max_steps, 
             logging_steps=args.logging_steps,
             save_steps=args.save_steps,
-            resume_from_checkpoint=args.resume_from_checkpoint,
+            resume_from_checkpoint=args.resume_from_checkpoint
         )
-        print("Fine-tuning complete!")

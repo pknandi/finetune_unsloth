@@ -3,10 +3,7 @@
 # Exit immediately if a command crashes
 set -e
 
-# ==========================================
-# EXPORTS
-# ==========================================
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 ENV_FILE="${ENV_FILE:-.env}"
 
@@ -20,9 +17,6 @@ else
     echo "Warning: Env file not found: $ENV_FILE"
 fi
 
-# ==========================================
-# STAGE CONTROL
-# ==========================================
 STAGE=${STAGE:-1}
 STOP_STAGE=${STOP_STAGE:-999}
 
@@ -31,7 +25,7 @@ echo "Running with STAGE=$STAGE STOP_STAGE=$STOP_STAGE"
 # ==========================================
 # RUN + LOGGING
 # ==========================================
-RUN_NAME="run-may13"
+RUN_NAME="run-jul8"
 
 LOG_DIR="./outputs/terminal"
 LOG_FILE="$LOG_DIR/$(date '+%Y-%m-%d_%H-%M-%S').log"
@@ -45,9 +39,6 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "Logging terminal output to: $LOG_FILE"
 
-# ==========================================
-# COLORS
-# ==========================================
 CYAN='\033[1;36m'
 YELLOW='\033[1;33m'
 GREEN='\033[1;32m'
@@ -55,32 +46,24 @@ MAGENTA='\033[1;35m'
 NC='\033[0m' # No color
 
 # ==========================================
-# TOKENIZER CONFIG
+# TOKENIZER + TRAINING CONFIG
 # ==========================================
 
-TOK_ROOT_FOLDER="./Motion_speech_project/tokenizer_data"              # Tokenizer training dataset
+TOK_ROOT_FOLDER="./sample_dataset"                                    # Tokenizer training dataset
 TOK_CSV="./outputs/$RUN_NAME/tokenizer_dataset_mapping.csv"          # audio_filename,motion_dirname
 TOK_SAVE_DIR="./outputs/$RUN_NAME/motion_tokenizer_artifacts"        # tokenizer.pkl + normalizer.npz
 
 N_CLUSTERS=1024                                                       # Motion token vocabulary size
 
-# ==========================================
-# TRAINING CONFIG
-# ==========================================
-
-TRAIN_ROOT_FOLDER="./Motion_speech_project/tokenizer_data"           # LLM training dataset
+TRAIN_ROOT_FOLDER="./sample_dataset"                                  # LLM training dataset
 TRAIN_CSV="./outputs/$RUN_NAME/training_dataset_mapping.csv"         # Training dataset CSV
 TRAIN_JSONL="./outputs/$RUN_NAME/speech_motion_train.jsonl"          # Final tokenized dataset
 
 OUTPUT_DIR="./outputs/$RUN_NAME/lora"                                # LoRA checkpoints
 BASE_MODEL="unsloth/llama-3-8b-bnb-4bit"                             # Base model
-RESUME_CHECKPOINT="" #"./outputs/$RUN_NAME/lora/checkpoint-2500"
+# RESUME_CHECKPOINT= "./outputs/$RUN_NAME/lora/checkpoint-2500"
 
-# ==========================================
-# TRAINING HYPERPARAMETERS
-# ==========================================
-
-MAX_STEPS=10000
+MAX_STEPS=2510
 LOGGING_STEPS=5
 SAVE_STEPS=2500
 
@@ -88,19 +71,29 @@ SAVE_STEPS=2500
 # INFERENCE CONFIG
 # ==========================================
 
-AUDIO_FILE_NAME="c--20250108--1300--DXG448--SZM479--JON169--BWW760--pilot--MotionPrior--ACTING_Adult_Birthday_--103301-106600.wav"  # Just the filename, not full path
-AUDIO_BASENAME=$(basename "$AUDIO_FILE_NAME" .wav)                   # abc.wav -> abc
-INFERENCE_AUDIO="/home/mubtasim/speech-motion/Motion_speech_project/motion_speech_dataset/audio/c--20250108--1300--DXG448--SZM479--JON169--BWW760--pilot--MotionPrior--ACTING_Adult_Birthday_--103301-106600/BWW760/audio_separated/c--20250108--1300--DXG448--SZM479--JON169--BWW760--pilot--MotionPrior--ACTING_Adult_Birthday_--103301-106600.wav"
-INFERECE_CHECKPOINT="./outputs/$RUN_NAME/lora/checkpoint-2500"
-INFERENCE_OUTPUT="./outputs/$RUN_NAME/inference/generated_motion_${RUN_NAME}_$(echo "$BASE_MODEL" | sed 's/[^a-zA-Z0-9]/_/g' | sed 's/_\+/_/g' | sed 's/^_\|_$//g')_${AUDIO_BASENAME}.npy"
-INFERENCE_VIDEO="./outputs/$RUN_NAME/inference/video_${RUN_NAME}_$(echo "$BASE_MODEL" | sed 's/[^a-zA-Z0-9]/_/g' | sed 's/_\+/_/g' | sed 's/^_\|_$//g')_${AUDIO_BASENAME}.mp4"
-SMPLX_MODEL_DIR="./outputs/smplx/models"
+# Must match a session actually present under TRAIN_ROOT_FOLDER above — this is a
+# memorization sanity check (same tiny dataset for train + test), not a generalization test.
+SESSION_NAME="c--20250108--1300--DXG448--SZM479--JON169--BWW760--pilot--MotionPrior--ACTING_Adult_Birthday_--103301-106600"
 
-# Ground truth: session dir (contains BWW760, DXG448, etc. sub-dirs) + subject
-GT_SESSION_DIR="./Motion_speech_project/motion_speech_dataset/smplx/c--20250108--1300--DXG448--SZM479--JON169--BWW760--pilot--MotionPrior--ACTING_Adult_Birthday_--103301-106600"
+# Subject to test — must be one of the ones the model actually saw in training
+# (see outputs/$RUN_NAME/training_dataset_mapping.csv): SZM479, BWW760, DXG448, JON169
 GT_SUBJECT="BWW760"
-COMPARISON_VIDEO="./outputs/$RUN_NAME/inference/comparison_${RUN_NAME}_${BASE_MODEL_SLUG}_${AUDIO_BASENAME}.mp4"
 
+AUDIO_FILE_NAME="${SESSION_NAME}.wav"
+AUDIO_BASENAME=$(basename "$AUDIO_FILE_NAME" .wav)
+
+BASE_MODEL_SLUG=$(echo "$BASE_MODEL" | sed 's/[^a-zA-Z0-9]/_/g' | sed 's/_\+/_/g' | sed 's/^_\|_$//g')
+
+INFERENCE_CHECKPOINT="./outputs/$RUN_NAME/lora/checkpoint-2500" # Update this if your steps change!
+
+INFERENCE_OUTPUT="./outputs/$RUN_NAME/inference/generated_motion_${RUN_NAME}_${BASE_MODEL_SLUG}_${GT_SUBJECT}_${AUDIO_BASENAME}.npy"
+INFERENCE_VIDEO="./outputs/$RUN_NAME/inference/video_${RUN_NAME}_${BASE_MODEL_SLUG}_${GT_SUBJECT}_${AUDIO_BASENAME}.mp4"
+COMPARISON_VIDEO="./outputs/$RUN_NAME/inference/comparison_${RUN_NAME}_${BASE_MODEL_SLUG}_${GT_SUBJECT}_${AUDIO_BASENAME}.mp4"
+
+# Derived from TRAIN_ROOT_FOLDER so train/test always point at the same dataset copy.
+INFERENCE_AUDIO="${TRAIN_ROOT_FOLDER}/audio/${SESSION_NAME}/${GT_SUBJECT}/audio_separated/${AUDIO_FILE_NAME}"
+GT_SESSION_DIR="${TRAIN_ROOT_FOLDER}/smplx/${SESSION_NAME}"
+SMPLX_MODEL_DIR="./outputs/smplx/models"
 
 #################################################################################################################
 echo -e "${CYAN}==========================================${NC}"
@@ -119,12 +112,12 @@ if [ "$STAGE" -le 1 ] && [ "$STOP_STAGE" -ge 1 ]; then
 fi
 
 # ---------------------------------------------------------
-# STEP 2: Train K-Means Motion Tokenizer
+# STEP 2: Train Motion Tokenizer
 # ---------------------------------------------------------
 if [ "$STAGE" -le 2 ] && [ "$STOP_STAGE" -ge 2 ]; then
-    echo -e "\n${YELLOW}=> [2/6] Training K-Means Motion Tokenizer...${NC}"
+    echo -e "\n${YELLOW}=> [2/6] Training Motion Tokenizer...${NC}"
 
-    python3 k_means_motion_tokenizer.py \
+    python3 vqvae_motion_tokenizer.py \
         --csv_path $TOK_CSV \
         --save_dir $TOK_SAVE_DIR \
         --n_clusters $N_CLUSTERS \
@@ -150,7 +143,7 @@ if [ "$STAGE" -le 4 ] && [ "$STOP_STAGE" -ge 4 ]; then
 
     python3 speech_to_motion_pipeline.py --build_dataset \
         --csv_path $TRAIN_CSV \
-        --tokenizer_path "$TOK_SAVE_DIR/tokenizer.pkl" \
+        --tokenizer_path "$TOK_SAVE_DIR/tokenizer.pt" \
         --normalizer_path "$TOK_SAVE_DIR/normalizer.npz" \
         --output_jsonl $TRAIN_JSONL
 fi
@@ -167,8 +160,10 @@ if [ "$STAGE" -le 5 ] && [ "$STOP_STAGE" -ge 5 ]; then
         --base_model $BASE_MODEL \
         --max_steps $MAX_STEPS \
         --logging_steps $LOGGING_STEPS \
-        --save_steps $SAVE_STEPS \
-        --resume_from_checkpoint $RESUME_CHECKPOINT
+        --save_steps $SAVE_STEPS #\
+        #--resume_from_checkpoint $RESUME_CHECKPOINT
+
+    echo -e "${GREEN}Model saved to: $OUTPUT_DIR${NC}"
 fi
 
 # ---------------------------------------------------------
@@ -180,19 +175,14 @@ if [ "$STAGE" -le 6 ] && [ "$STOP_STAGE" -ge 6 ]; then
     # python3 run_inference.py 
     python3 speech_to_motion_inference.py\
         --audio_path $INFERENCE_AUDIO \
-        --lora_model_dir "$INFERECE_CHECKPOINT" \
-        --tokenizer_path "$TOK_SAVE_DIR/tokenizer.pkl" \
+        --lora_model_dir "$INFERENCE_CHECKPOINT" \
+        --tokenizer_path "$TOK_SAVE_DIR/tokenizer.pt" \
         --normalizer_path "$TOK_SAVE_DIR/normalizer.npz" \
         --base_model $BASE_MODEL \
         --output_npy_path $INFERENCE_OUTPUT
 
 
-    echo -e "\n${GREEN}==========================================${NC}"
-    echo -e "${GREEN}✅ Pipeline Complete!${NC}"
-    echo -e "${GREEN}Model saved to: $OUTPUT_DIR${NC}"
     echo -e "${GREEN}Motion output saved to: $INFERENCE_OUTPUT${NC}"
-    echo -e "${GREEN}==========================================${NC}"
-
 fi
 
 # ---------------------------------------------------------
@@ -209,19 +199,11 @@ if [ "$STAGE" -le 7 ] && [ "$STOP_STAGE" -ge 7 ]; then
     echo -e "\n${GREEN}=> Visualization complete: $INFERENCE_VIDEO${NC}"
 fi
 
-
 # ---------------------------------------------------------
 # STEP 8: Side-by-side GT vs Predicted Comparison Video
 # ---------------------------------------------------------
 if [ "$STAGE" -le 8 ] && [ "$STOP_STAGE" -ge 8 ]; then
     echo -e "\n${CYAN}=> [8/8] Rendering GT vs Predicted Comparison Video...${NC}"
-
-    # Diagnostics first — prints frame counts, no rendering
-    echo -e "${YELLOW}  -- Diagnostics --${NC}"
-    python3 compare_motion.py --diagnose \
-        --session_dir "$GT_SESSION_DIR" \
-        --subject     "$GT_SUBJECT" \
-        --pred_npy    "$INFERENCE_OUTPUT"
 
     # Render side-by-side
     python3 compare_motion.py \

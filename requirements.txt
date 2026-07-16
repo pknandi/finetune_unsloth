@@ -19,3 +19,5 @@ gradio
 librosa
 torchmetrics
 soundfile
+vector_quantize_pytorch
+tiktoken==0.13.0

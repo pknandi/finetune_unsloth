@@ -75,26 +75,27 @@ def build_joint_jsonl(
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
     audio_fps = 75
-    motion_fps = 7.5 # VQVAE 4x Compression (30 / 4)
+    motion_fps = 15  # VQVAE 2x Compression (30 / 2)
+    audio_to_motion_ratio = int(audio_fps // motion_fps)  # 5
 
     with output_jsonl.open("w", encoding="utf-8") as f:
         for i, row in df.iterrows():
             try:
                 audio_codes = tokenize_audio_encodec(row["audio_filename"], bandwidth=audio_bandwidth)
-                
+
                 motion = load_smplx_sequence(row["motion_dirname"])
                 motion = preprocess_motion(motion)
                 motion = norm.transform(motion)
                 motion_codes = motion_tok.encode(motion)
 
-                # Exact 10:1 Temporal Alignment Math
+                # Exact 5:1 Temporal Alignment Math
                 actual_audio_sec = audio_codes.shape[1] / audio_fps
                 actual_motion_sec = motion_codes.shape[0] / motion_fps
                 valid_sec = min(actual_audio_sec, actual_motion_sec, max_duration_sec)
-                
+
                 raw_a_frames = int(valid_sec * audio_fps)
-                max_a_frames = (raw_a_frames // 10) * 10 
-                max_m_frames = max_a_frames // 10
+                max_a_frames = (raw_a_frames // audio_to_motion_ratio) * audio_to_motion_ratio
+                max_m_frames = max_a_frames // audio_to_motion_ratio
                 
                 audio_codes = audio_codes[:, :max_a_frames]
                 motion_codes = motion_codes[:max_m_frames]

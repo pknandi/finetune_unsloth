@@ -3,7 +3,7 @@
 # Exit immediately if a command crashes
 set -e
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 ENV_FILE="${ENV_FILE:-.env}"
 
@@ -25,7 +25,7 @@ echo "Running with STAGE=$STAGE STOP_STAGE=$STOP_STAGE"
 # ==========================================
 # RUN + LOGGING
 # ==========================================
-RUN_NAME="run-jul8"
+RUN_NAME="run-jul21"
 
 LOG_DIR="./outputs/terminal"
 LOG_FILE="$LOG_DIR/$(date '+%Y-%m-%d_%H-%M-%S').log"
@@ -61,11 +61,11 @@ TRAIN_JSONL="./outputs/$RUN_NAME/speech_motion_train.jsonl"          # Final tok
 
 OUTPUT_DIR="./outputs/$RUN_NAME/lora"                                # LoRA checkpoints
 BASE_MODEL="unsloth/llama-3-8b-bnb-4bit"                             # Base model
-# RESUME_CHECKPOINT= "./outputs/$RUN_NAME/lora/checkpoint-2500"
+# RESUME_CHECKPOINT= "./outputs/$RUN_NAME/lora/checkpoint-500"
 
-MAX_STEPS=2510
+MAX_STEPS=510
 LOGGING_STEPS=5
-SAVE_STEPS=2500
+SAVE_STEPS=500
 
 # ==========================================
 # INFERENCE CONFIG
@@ -84,7 +84,7 @@ AUDIO_BASENAME=$(basename "$AUDIO_FILE_NAME" .wav)
 
 BASE_MODEL_SLUG=$(echo "$BASE_MODEL" | sed 's/[^a-zA-Z0-9]/_/g' | sed 's/_\+/_/g' | sed 's/^_\|_$//g')
 
-INFERENCE_CHECKPOINT="./outputs/$RUN_NAME/lora/checkpoint-2500" # Update this if your steps change!
+INFERENCE_CHECKPOINT="./outputs/$RUN_NAME/lora/checkpoint-500" # Update this if your steps change!
 
 INFERENCE_OUTPUT="./outputs/$RUN_NAME/inference/generated_motion_${RUN_NAME}_${BASE_MODEL_SLUG}_${GT_SUBJECT}_${AUDIO_BASENAME}.npy"
 INFERENCE_VIDEO="./outputs/$RUN_NAME/inference/video_${RUN_NAME}_${BASE_MODEL_SLUG}_${GT_SUBJECT}_${AUDIO_BASENAME}.mp4"
@@ -212,6 +212,7 @@ if [ "$STAGE" -le 8 ] && [ "$STOP_STAGE" -ge 8 ]; then
         --pred_npy    "$INFERENCE_OUTPUT" \
         --audio_path  "$INFERENCE_AUDIO" \
         --output_path "$COMPARISON_VIDEO" \
+        --smplx_model_dir "$SMPLX_MODEL_DIR" \
         --fps         30 \
         --max_seconds 10.0 \
         --width       1280 \

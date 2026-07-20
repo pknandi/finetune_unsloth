@@ -52,8 +52,9 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
     print("1. Extracting and Aligning Audio Tokens...")
     audio_codes = tokenize_audio_encodec(audio_path)
     
+    audio_to_motion_ratio = 5  # VQVAE 2x compression: 75 audio-fps / 15 motion-fps
     max_a_frames = min(audio_codes.shape[1], 750)
-    max_a_frames = (max_a_frames // 10) * 10
+    max_a_frames = (max_a_frames // audio_to_motion_ratio) * audio_to_motion_ratio
     audio_codes = audio_codes[:, :max_a_frames]
     
     prompt = f"<|audio|>{audio_tokens_to_text(audio_codes)}<|motion|>"
@@ -74,14 +75,19 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
     FastLanguageModel.for_inference(model)
     inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
     
-    print("3. Generating Motion Tokens (with Repetition Penalty)...")
+    print("3. Generating Motion Tokens (greedy, no repetition penalty)...")
+    # Greedy decoding with repetition_penalty=1.0: this pipeline is currently being
+    # trained on a tiny, intentionally-overfit dataset where the correct motion-token
+    # sequence for a given clip legitimately repeats the same token 60-90% of the time
+    # (long static holds). do_sample + repetition_penalty actively fought that learned
+    # distribution, pushing the model off of what it actually memorized. Revisit once
+    # training data is large/diverse enough that repeated tokens are no longer the norm.
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
             max_new_tokens=1500,
-            do_sample=True,          # Turned ON to allow smooth motion
-            temperature=0.2,         # Very low temp prevents random flailing
-            repetition_penalty=1.1,  # CRITICAL: Prevents the model from freezing
+            do_sample=False,
+            repetition_penalty=1.0,
             pad_token_id=tokenizer.eos_token_id,
         )
 
@@ -104,9 +110,31 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
     motion_feat = motion_tok.decode(np.array(motion_ids))
     motion_feat = (motion_feat * norm.std) + norm.mean
 
-    transl_vel = motion_feat[:, -3:]
-    transl = np.cumsum(transl_vel, axis=0)
-    final_smplx_array = np.concatenate([motion_feat[:, :-3], transl], axis=-1)
+    # motion_feat layout matches preprocess_motion's output: [go_sin(3), go_cos(3),
+    # body(63), left_hand(45), right_hand(45), transl(3)] = 162 dims.
+    # Undo the sin/cos wrap-around-safe encoding to recover a plain axis-angle
+    # global_orient. Translation is stored as absolute world position (already
+    # un-normalized above) — no velocity integration, so no accumulating drift.
+    global_orient = np.arctan2(motion_feat[:, 0:3], motion_feat[:, 3:6])
+    body_and_hands = motion_feat[:, 6:159]
+    transl = motion_feat[:, 159:162]
+
+    # Root translation is physically low-frequency (a body can't oscillate its
+    # pelvis several cm per frame), but codebook quantization noise on the transl
+    # channels un-normalizes into exactly that kind of frame-level wobble, which
+    # renders as the character floating/gliding. A short centered moving average
+    # (~0.37s at 30fps output) removes the wobble while preserving real walking
+    # trajectories, which live at much lower frequencies.
+    win = 11
+    if len(transl) >= win:
+        kernel = np.ones(win) / win
+        pad = win // 2
+        padded = np.pad(transl, ((pad, pad), (0, 0)), mode="edge")
+        transl = np.stack(
+            [np.convolve(padded[:, c], kernel, mode="valid") for c in range(3)], axis=-1
+        )
+
+    final_smplx_array = np.concatenate([global_orient, body_and_hands, transl], axis=-1)
 
     np.save(output_npy_path, final_smplx_array)
     print(f"Saved motion to: {output_npy_path}")

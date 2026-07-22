@@ -51,7 +51,10 @@ def audio_tokens_to_text(codes: np.ndarray) -> str:
     return "".join(parts) # NO SPACES
 
 def motion_tokens_to_text(tokens: np.ndarray) -> str:
-    return "".join(f"<m_{int(t)}>" for t in tokens.reshape(-1)) # NO SPACES
+    # tokens: (T, Q) — Q residual-VQ levels per temporal block, mirroring the
+    # audio format <a_q_i>. Interleaved per block: <m_0_x><m_1_y><m_2_z><m_3_w>...
+    T, Q = tokens.shape
+    return "".join(f"<m_{q}_{int(tokens[t, q])}>" for t in range(T) for q in range(Q)) # NO SPACES
 
 # =========================
 # 2) Build training JSONL
@@ -112,10 +115,11 @@ def build_joint_jsonl(
 # =========================
 # 3) Training prep & Debug
 # =========================
-def add_discrete_tokens(tokenizer, audio_codebook_size=1024, audio_num_codebooks=8, motion_vocab_size=1024):
+def add_discrete_tokens(tokenizer, audio_codebook_size=1024, audio_num_codebooks=8,
+                        motion_vocab_size=1024, motion_num_codebooks=4):
     special = ["<|audio|>", "<|motion|>"]
     special += [f"<a_{q}_{i}>" for q in range(audio_num_codebooks) for i in range(audio_codebook_size)]
-    special += [f"<m_{i}>" for i in range(motion_vocab_size)]
+    special += [f"<m_{q}_{i}>" for q in range(motion_num_codebooks) for i in range(motion_vocab_size)]
     tokenizer.add_special_tokens({"additional_special_tokens": special})
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

@@ -17,10 +17,12 @@ from encodec.utils import convert_audio
 
 from vqvae_motion_tokenizer import VQVAETokenizer, Normalizer
 
+MOTION_NUM_CODEBOOKS = 4  # must match MotionVQVAE num_quantizers and training-side add_discrete_tokens
+
 def add_discrete_tokens(tokenizer):
     special = ["<|audio|>", "<|motion|>"]
     special += [f"<a_{q}_{i}>" for q in range(8) for i in range(1024)]
-    special += [f"<m_{i}>" for i in range(1024)]
+    special += [f"<m_{q}_{i}>" for q in range(MOTION_NUM_CODEBOOKS) for i in range(1024)]
     tokenizer.add_special_tokens({"additional_special_tokens": special})
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -92,14 +94,33 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
         )
 
     completion_text = tokenizer.decode(outputs[0], skip_special_tokens=False).split("<|motion|>")[-1]
-    motion_ids = [int(x) for x in re.findall(r"<m_(\d+)>", completion_text)]
-    if not motion_ids:
+    # Multi-level RVQ tokens: <m_q_i> where q is the residual level. Each temporal
+    # block is a run of MOTION_NUM_CODEBOOKS tokens in level order (q=0,1,2,3).
+    pairs = [(int(q), int(i)) for q, i in re.findall(r"<m_(\d+)_(\d+)>", completion_text)]
+    if not pairs:
         print("Model failed to generate motion tokens.")
         return
 
+    # Group into complete blocks, tolerating malformed output: keep only runs
+    # where the levels appear in the exact expected order, drop anything partial.
+    Q = MOTION_NUM_CODEBOOKS
+    blocks = []
+    idx = 0
+    while idx + Q <= len(pairs):
+        chunk = pairs[idx:idx + Q]
+        if [q for q, _ in chunk] == list(range(Q)):
+            blocks.append([i for _, i in chunk])
+            idx += Q
+        else:
+            idx += 1  # resync: skip one token and look for the next full block
+    if not blocks:
+        print("Model generated motion tokens but no complete level-ordered blocks.")
+        return
+    motion_ids = np.array(blocks, dtype=np.int64)  # (T, Q)
+
     # DEBUG PRINT: This will show you if the LLM is actually generating diverse motion!
-    print(f"   -> Generated {len(motion_ids)} tokens.")
-    print(f"   -> First 15 tokens: {motion_ids[:15]}")
+    print(f"   -> Generated {len(pairs)} tokens -> {motion_ids.shape[0]} temporal blocks.")
+    print(f"   -> First 3 blocks: {motion_ids[:3].tolist()}")
 
     print("4. VQ-VAE Decoding...")
     motion_tok = VQVAETokenizer()
@@ -107,7 +128,7 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
     norm = Normalizer()
     norm.load(normalizer_path)
 
-    motion_feat = motion_tok.decode(np.array(motion_ids))
+    motion_feat = motion_tok.decode(motion_ids)
     motion_feat = (motion_feat * norm.std) + norm.mean
 
     # motion_feat layout matches preprocess_motion's output: [go_sin(3), go_cos(3),

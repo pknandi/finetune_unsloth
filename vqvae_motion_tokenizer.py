@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from vector_quantize_pytorch import VectorQuantize
+from vector_quantize_pytorch import ResidualVQ
 
 SMPLX_PARTS = [
     "smplx_mesh_global_orient",
@@ -138,7 +138,8 @@ class Normalizer:
 # 2. VQ-VAE Architecture
 # ==========================================
 class MotionVQVAE(nn.Module):
-    def __init__(self, input_dim=162, hidden_dim=256, latent_dim=256, codebook_size=1024):
+    def __init__(self, input_dim=162, hidden_dim=256, latent_dim=256, codebook_size=1024,
+                 num_quantizers=4):
         super().__init__()
         
         # Encoder (2x temporal downsampling). Was 4x: each token covered an 8-16fps-
@@ -153,18 +154,22 @@ class MotionVQVAE(nn.Module):
             nn.Conv1d(hidden_dim, latent_dim, kernel_size=3, stride=1, padding=1),
         )
         
-        # Production Quantizer. Euclidean distance, NOT cosine: cosine similarity
-        # normalizes latents to the unit sphere, so codes capture direction only
-        # and magnitude is discarded — a big arm swing and a small one collapse to
-        # the same code. Measured effect: reconstructed amplitude shrank to ~0.45x
-        # GT on global_orient. Euclidean codes keep magnitude, which is what
-        # motion needs (and what standard motion-VQ setups use).
-        self.quantizer = VectorQuantize(
+        # Residual VQ, mirroring EnCodec's design on the audio side. A single
+        # code per 2-frame block = 10 bits for the entire 162-dim body state —
+        # enough for static poses, structurally too little for dynamic bursts
+        # (walking + turning + limb swings at once), which is why dynamics kept
+        # reconstructing at a fraction of GT energy no matter how the loss was
+        # weighted. Each RVQ level quantizes the residual the previous level
+        # missed, giving num_quantizers x the bits per block; coarse levels carry
+        # the dominant pose, finer levels carry exactly the high-energy detail
+        # that was being lost. Euclidean distance (RVQ default), not cosine —
+        # cosine discards magnitude, which had shrunk amplitudes to ~0.45x GT.
+        self.quantizer = ResidualVQ(
             dim=latent_dim,
+            num_quantizers=num_quantizers,
             codebook_size=codebook_size,
             decay=0.8,
             commitment_weight=1.0,
-            use_cosine_sim=False,
             kmeans_init=True,            # seed codes from real encoder outputs, not random init
             kmeans_iters=10,
             threshold_ema_dead_code=2,    # reset codes that stop getting used instead of leaving them dead
@@ -186,9 +191,9 @@ class MotionVQVAE(nn.Module):
 
     def forward(self, x):
         encoded = self.encoder(x).permute(0, 2, 1)
-        quantized, indices, vq_loss = self.quantizer(encoded)
+        quantized, indices, vq_loss = self.quantizer(encoded)  # indices (B,T,Q), vq_loss (Q,)
         decoded = self.decoder(quantized.permute(0, 2, 1))
-        return decoded, vq_loss, indices
+        return decoded, vq_loss.sum(), indices
 
     @torch.no_grad()
     def encode_to_tokens(self, x):
@@ -277,9 +282,11 @@ class VQVAETokenizer:
         x = torch.tensor(motion, dtype=torch.float32).unsqueeze(0).permute(0, 2, 1).to(self.device)
         with torch.no_grad():
             tokens = self.model.encode_to_tokens(x)
-        return tokens.squeeze().cpu().numpy().astype(np.int32)
+        # (1, T, Q) -> (T, Q): one row per temporal block, one column per RVQ level
+        return tokens.squeeze(0).cpu().numpy().astype(np.int32)
 
     def decode(self, tokens: np.ndarray) -> np.ndarray:
+        """tokens: (T, Q) int array — Q residual-VQ levels per temporal block."""
         self.model.eval()
         t_tensor = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(self.device)
         with torch.no_grad():
@@ -370,7 +377,10 @@ def tokenize_csv_to_jsonl(csv_path: str | Path, save_dir: str | Path, output_jso
                     "id": str(i),
                     "audio_filename": row["audio_filename"],
                     "motion_dirname": row["motion_dirname"],
-                    "motion_tokens": "".join(f"<m_{int(t)}>" for t in tokens.reshape(-1)),
+                    "motion_tokens": "".join(
+                        f"<m_{q}_{int(tokens[t, q])}>"
+                        for t in range(tokens.shape[0]) for q in range(tokens.shape[1])
+                    ),
                 }
                 f.write(json.dumps(sample, ensure_ascii=False) + "\n")
             except Exception as e:

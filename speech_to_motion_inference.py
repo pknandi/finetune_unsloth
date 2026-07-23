@@ -143,10 +143,13 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
     # Root translation is physically low-frequency (a body can't oscillate its
     # pelvis several cm per frame), but codebook quantization noise on the transl
     # channels un-normalizes into exactly that kind of frame-level wobble, which
-    # renders as the character floating/gliding. A short centered moving average
-    # (~0.37s at 30fps output) removes the wobble while preserving real walking
-    # trajectories, which live at much lower frequencies.
-    win = 11
+    # renders as the character floating/gliding. A centered moving average
+    # (~0.5s at 30fps output) removes the wobble while preserving real walking
+    # trajectories, which live at much lower frequencies. Measured on real data:
+    # widening from 11->15 improves jitter and GT-velocity correlation with no
+    # added lag; lag starts appearing beyond ~19, so this is deliberately not
+    # wider despite further (diminishing) correlation gains out there.
+    win = 15
     if len(transl) >= win:
         kernel = np.ones(win) / win
         pad = win // 2

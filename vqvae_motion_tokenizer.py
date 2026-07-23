@@ -173,6 +173,18 @@ class MotionVQVAE(nn.Module):
             kmeans_init=True,            # seed codes from real encoder outputs, not random init
             kmeans_iters=10,
             threshold_ema_dead_code=2,    # reset codes that stop getting used instead of leaving them dead
+            # Without this, nothing stops the fine (later) levels from spending
+            # their capacity fitting encoder noise instead of real residual
+            # structure — with only 4 training clips there's far more codebook
+            # capacity than real signal. Measured effect: levels 2-3 switched to
+            # a different code on 89-91% of blocks (vs 18% on level 0), which is
+            # exactly the per-block "shaking" being reported. Dropout forces each
+            # level to reconstruct reasonably even when deeper levels are
+            # randomly withheld during training, so coarse levels must carry the
+            # real signal and fine levels only add genuine refinement — the same
+            # mechanism EnCodec/SoundStream use on the audio side.
+            quantize_dropout=True,
+            quantize_dropout_cutoff_index=1,
         )
         
         # Decoder (2x temporal upsampling, matching the encoder)

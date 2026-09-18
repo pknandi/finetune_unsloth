@@ -17,7 +17,7 @@ from encodec.utils import convert_audio
 
 from vqvae_motion_tokenizer import VQVAETokenizer, Normalizer
 
-MOTION_NUM_CODEBOOKS = 4  # must match MotionVQVAE num_quantizers and training-side add_discrete_tokens
+MOTION_NUM_CODEBOOKS = 2  # must match MotionVQVAE num_quantizers and training-side add_discrete_tokens
 
 def add_discrete_tokens(tokenizer):
     special = ["<|audio|>", "<|motion|>"]
@@ -31,15 +31,24 @@ def add_discrete_tokens(tokenizer):
 def tokenize_audio_encodec(audio_path: str, bandwidth: float = 6.0) -> np.ndarray:
     model = EncodecModel.encodec_model_24khz()
     model.set_target_bandwidth(bandwidth)
-    
+    # RVQ codebook lookups are nearest-neighbor on continuous encoder output, so tiny
+    # CPU-vs-GPU floating-point differences can flip a token index right at a decision
+    # boundary (measured ~0.7% of positions on a real clip — not a bug, just numeric
+    # non-determinism between devices). build_joint_jsonl encodes training audio on GPU
+    # when available; doing the same here keeps inference-time tokens on the same
+    # footing as what the model was actually trained on, instead of a silent train/
+    # inference device skew on top of whatever the model already has to generalize over.
+    if torch.cuda.is_available():
+        model = model.cuda()
+
     wav_np, sr = sf.read(str(audio_path), dtype="float32")
     wav = torch.from_numpy(wav_np).t()
     if wav.ndim == 1:
         wav = wav.unsqueeze(0)
-        
+
     wav = convert_audio(wav, sr, model.sample_rate, model.channels)
-    wav = wav.unsqueeze(0)
-    
+    wav = wav.unsqueeze(0).to(next(model.parameters()).device)
+
     with torch.no_grad():
         encoded_frames = model.encode(wav)
         
@@ -50,7 +59,9 @@ def audio_tokens_to_text(codes: np.ndarray) -> str:
     n_q, T = codes.shape
     return "".join(f"<a_{q}_{int(codes[q, t])}>" for t in range(T) for q in range(n_q)) 
 
-def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, normalizer_path, output_npy_path, base_model):
+def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, normalizer_path, output_npy_path, base_model,
+                                do_sample=True, temperature=1.0, top_p=0.9, repetition_penalty=1.2,
+                                no_repeat_ngram_size=0):
     print("1. Extracting and Aligning Audio Tokens...")
     audio_codes = tokenize_audio_encodec(audio_path)
     
@@ -77,21 +88,76 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
     FastLanguageModel.for_inference(model)
     inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
     
-    print("3. Generating Motion Tokens (greedy, no repetition penalty)...")
-    # Greedy decoding with repetition_penalty=1.0: this pipeline is currently being
-    # trained on a tiny, intentionally-overfit dataset where the correct motion-token
-    # sequence for a given clip legitimately repeats the same token 60-90% of the time
-    # (long static holds). do_sample + repetition_penalty actively fought that learned
-    # distribution, pushing the model off of what it actually memorized. Revisit once
-    # training data is large/diverse enough that repeated tokens are no longer the norm.
+    print(f"3. Generating Motion Tokens (do_sample={do_sample}, temperature={temperature}, "
+          f"top_p={top_p}, repetition_penalty={repetition_penalty})...")
+    # Was greedy + repetition_penalty=1.0 while this pipeline trained on a tiny,
+    # intentionally-overfit dataset (same clip in train and test) — there, the "correct"
+    # motion-token sequence legitimately repeated the same token 60-90% of the time (long
+    # static holds), and do_sample/repetition_penalty actively fought that learned
+    # distribution, pushing the model off what it had memorized. Now that training data is
+    # the full, diverse Embody-3D corpus, greedy decoding is the wrong default: it always
+    # takes the single most likely next token, which collapses onto exactly the kind of
+    # repeated-token degenerate loop repetition_penalty exists to prevent, and produces one
+    # fixed output per audio input with no ability to sample multiple candidate gestures.
+    # Sampling with a repetition penalty is the standard choice once outputs are meant to
+    # reflect real learned diversity rather than a memorized answer. Pass do_sample=False
+    # to go back to the old greedy/memorization-check behavior for a specific debug run.
+    #
+    # temperature=0.7 (the first full-dataset default) was a real bug, not just "too
+    # weak": dividing logits by a value BELOW 1.0 SHARPENS the distribution — it makes
+    # the model MORE deterministic/repetitive, the opposite of what fights a repeat
+    # collapse. Measured on a real full-dataset generation: 265 of 299 frame-to-frame
+    # body-pose deltas were identical to 5 decimal places (a single repeated 4-token RVQ
+    # block replayed for 8.8 of 10 seconds) — repetition_penalty=1.15 was not remotely
+    # enough to break a lock that confident.
+    #
+    # temperature=1.0 (neutral — the raw trained distribution, neither sharpened nor
+    # flattened) + repetition_penalty=1.2 is chosen from a real head-to-head, not just
+    # "more must be better": (temp, rep) = (1.2, 1.3), (1.0, 1.15), (1.0, 1.2), (0.9, 1.2)
+    # were all tested against the same checkpoint/audio. All four broke the repeat
+    # collapse (longest constant-delta run: 1 frame, vs. 265). None clearly beat the
+    # collapsed run's 764mm MPJPE, and all showed elevated jerk (15-32x GT, vs. the
+    # collapsed run's misleadingly-low 3x — a frozen signal has near-zero jerk almost by
+    # definition, so that comparison was never fair). (1.0, 1.2) was the least-bad of the
+    # four (699.9mm MPJPE) — this is the best decoding config found, not evidence that
+    # decoding alone fixes generation quality. It doesn't: every anti-collapse setting
+    # traded "frozen" for "noisy," which means the model's own learned distribution
+    # beyond its single dominant mode isn't coherent yet — a training-data/capacity
+    # problem (see run.sh's MAX_STEPS comment), not something a decoding flag can paper
+    # over. no_repeat_ngram_size is available but defaults off (0): it HARD-blocks any
+    # repeated n-gram, which also blocks legitimately-static motion (holding still while
+    # listening) — a blunter tool than temperature/repetition_penalty, and untested
+    # against the noise/collapse tradeoff above.
+    #
+    # IMPORTANT — these settings do not transparently transfer across checkpoints, and
+    # re-tuning them on a new one is not optional. Re-verified on run-full-aug30 (10000
+    # steps, ~2.5x the training of the checkpoint the numbers above came from, on a
+    # different motion-token vocabulary — the VQ-VAE was retrained too): (1.0, 1.2) still
+    # avoids collapse (1-frame run) but jerk got WORSE, not better, at 52x GT (vs. 20x
+    # before) — loss curve was healthy and still decreasing through the last epoch, so
+    # this isn't undertraining regressing, it's that a decoding config tuned for one
+    # model's probability landscape doesn't carry over to another's. A second sweep
+    # against THIS checkpoint found no config that both avoids collapse and controls
+    # jerk: --greedy freezes 277/299 frames (jerk 8.9x); (0.7, 1.15) freezes 153/299
+    # (jerk 9.0x, better MPJPE-vs-PCK than (1.0,1.2) despite the partial freeze); (1.0,
+    # 1.2) is the only zero-collapse setting found, at the cost of high jerk. Kept as the
+    # default because collapse was the more severe, visually-confusing failure to begin
+    # with, but this is a real, unresolved tradeoff, not a solved one — re-sweep again
+    # against any future checkpoint rather than assuming these numbers hold.
+    generate_kwargs = dict(
+        max_new_tokens=1500,
+        do_sample=do_sample,
+        repetition_penalty=repetition_penalty,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    if do_sample:
+        # Only meaningful (and only accepted without warnings) under sampling.
+        generate_kwargs["temperature"] = temperature
+        generate_kwargs["top_p"] = top_p
+    if no_repeat_ngram_size and no_repeat_ngram_size > 0:
+        generate_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
     with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=1500,
-            do_sample=False,
-            repetition_penalty=1.0,
-            pad_token_id=tokenizer.eos_token_id,
-        )
+        outputs = model.generate(**inputs, **generate_kwargs)
 
     completion_text = tokenizer.decode(outputs[0], skip_special_tokens=False).split("<|motion|>")[-1]
     # Multi-level RVQ tokens: <m_q_i> where q is the residual level. Each temporal
@@ -172,7 +238,33 @@ if __name__ == "__main__":
     parser.add_argument("--normalizer_path", type=str, required=True)
     parser.add_argument("--output_npy_path", type=str, required=True)
     parser.add_argument("--base_model", type=str, default="unsloth/llama-3-8b-bnb-4bit")
+    parser.add_argument("--greedy", action="store_true",
+                        help="Use greedy decoding instead of sampling — the old behavior, "
+                             "correct only for the tiny-overfit-set memorization check "
+                             "(same session in train and test), not for the full corpus.")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Below 1.0 SHARPENS the distribution (more repetitive, not less) — "
+                             "keep this >= 1.0 unless you have a specific reason to go lower.")
+    parser.add_argument("--top_p", type=float, default=0.9)
+    parser.add_argument("--repetition_penalty", type=float, default=1.2)
+    parser.add_argument("--no_repeat_ngram_size", type=int, default=0,
+                        help="Hard-blocks any repeated n-gram (0 = off). Stronger than "
+                             "repetition_penalty but also blocks legitimately-static motion "
+                             "(e.g. holding still while listening) — try only if repetition "
+                             "is still severe with the other flags.")
     args = parser.parse_args()
-    
+
     os.makedirs(os.path.dirname(args.output_npy_path), exist_ok=True)
-    generate_motion_from_audio(**vars(args))
+    generate_motion_from_audio(
+        audio_path=args.audio_path,
+        lora_model_dir=args.lora_model_dir,
+        tokenizer_path=args.tokenizer_path,
+        normalizer_path=args.normalizer_path,
+        output_npy_path=args.output_npy_path,
+        base_model=args.base_model,
+        do_sample=not args.greedy,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
+    )

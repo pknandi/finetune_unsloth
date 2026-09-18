@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 from vector_quantize_pytorch import ResidualVQ
 
 SMPLX_PARTS = [
@@ -93,14 +94,34 @@ def preprocess_motion(motion: np.ndarray) -> np.ndarray:
     body = motion[:, 3:66]
     left_hand = motion[:, 66:111]
     right_hand = motion[:, 111:156]
-    # Absolute world position, NOT velocity. Velocity + cumsum-at-decode was tried
-    # twice and both variants fail: (a) velocity alone loses the start position
-    # entirely (everything reconstructs at the origin); (b) stuffing the absolute
-    # start into frame 0 of the velocity channel makes that frame a ±60-85 sigma
-    # outlier after normalization — unrepresentable by the codebook — AND cumsum
-    # accumulates per-frame reconstruction error into metres of drift over a clip.
-    # Absolute position is bounded, normalizes cleanly, and decodes drift-free.
-    transl = motion[:, 156:159]
+    # Clip-relative position (delta from this sequence's own first frame), NOT
+    # absolute world position and NOT velocity.
+    #
+    # Velocity + cumsum-at-decode was tried and correctly rejected: (a) velocity alone
+    # loses the start position entirely (everything reconstructs at the origin);
+    # (b) stuffing the absolute start into frame 0 of the velocity channel makes that
+    # frame a +-60-85 sigma outlier after normalization (unrepresentable by the
+    # codebook), AND cumsum accumulates per-frame reconstruction error into metres of
+    # drift over a clip.
+    #
+    # Absolute world position (the original fix here) shares neither problem — bounded,
+    # normalizes cleanly, decodes drift-free — but has a different one, invisible until
+    # evaluated on a held-out session: every capture session has its own arbitrary room
+    # origin, uncorrelated with audio content. A model can only reproduce a specific
+    # session's absolute offset by having memorized that exact session — measured on a
+    # genuinely held-out session, absolute position accounted for 2181 of 2196mm total
+    # MPJPE (99.3%), vs. 118 of 135mm (88%) on a memorized one — not incrementally worse,
+    # categorically wrong, because the target itself isn't predictable from audio.
+    #
+    # Subtracting this sequence's own frame-0 position keeps every one of the original
+    # fix's properties (bounded, clean normalization, drift-free decode — this is still
+    # directly-predicted absolute position each frame, not integrated velocity) while
+    # removing the per-session arbitrary offset: every clip now starts at (0,0,0), so
+    # what's left to predict is actual movement, which audio can plausibly inform.
+    # build_joint_jsonl always keeps frames from the start of a row's session (see
+    # max_duration_sec truncation), so "this sequence's frame 0" and "this training
+    # example's frame 0" are the same frame — this is not a per-window rebase.
+    transl = motion[:, 156:159] - motion[0, 156:159]
 
     # global_orient is a large-swing rotation that can exceed +/-pi in raw mocap
     # data (real wrap-around observed in practice). A plain L1 loss on the raw
@@ -138,8 +159,17 @@ class Normalizer:
 # 2. VQ-VAE Architecture
 # ==========================================
 class MotionVQVAE(nn.Module):
+    # num_quantizers=4 (RVQ levels) was the original choice; measured via a teacher-forced
+    # accuracy/perplexity check on a real run-full-aug30 generation (10000 LLM training
+    # steps, healthy non-plateaued loss): level 0 62% top-1 / ppl 7.1, level 1 51% / 17.1,
+    # level 2 38% / 51.0, level 3 23% / 161.8 (out of a 1024-way vocab — barely above
+    # random). The finer levels aren't being learned at this data/capacity scale and were
+    # very likely the dominant source of the jerk/noise seen in generated motion — each
+    # decoded frame includes a large near-random contribution from levels 2-3 every step.
+    # Dropping to 2 removes exactly the two levels with no real learned signal, rather
+    # than giving the model more capacity to keep failing at the same overly-hard target.
     def __init__(self, input_dim=162, hidden_dim=256, latent_dim=256, codebook_size=1024,
-                 num_quantizers=4):
+                 num_quantizers=2):
         super().__init__()
         
         # Encoder (2x temporal downsampling). Was 4x: each token covered an 8-16fps-
@@ -173,16 +203,13 @@ class MotionVQVAE(nn.Module):
             kmeans_init=True,            # seed codes from real encoder outputs, not random init
             kmeans_iters=10,
             threshold_ema_dead_code=2,    # reset codes that stop getting used instead of leaving them dead
-            # Without this, nothing stops the fine (later) levels from spending
-            # their capacity fitting encoder noise instead of real residual
-            # structure — with only 4 training clips there's far more codebook
-            # capacity than real signal. Measured effect: levels 2-3 switched to
-            # a different code on 89-91% of blocks (vs 18% on level 0), which is
-            # exactly the per-block "shaking" being reported. Dropout forces each
-            # level to reconstruct reasonably even when deeper levels are
-            # randomly withheld during training, so coarse levels must carry the
-            # real signal and fine levels only add genuine refinement — the same
-            # mechanism EnCodec/SoundStream use on the audio side.
+            # Was targeted at levels 2-3 (dropped randomly during training so coarse
+            # levels 0-1 must carry the real signal) back when num_quantizers=4. With
+            # num_quantizers=2 above, cutoff_index=1 means "levels 0-1 always present"
+            # covers every remaining level — nothing is ever dropped now, so this is
+            # currently an inert no-op. Left in place (harmless) rather than removed, in
+            # case num_quantizers goes back up later; don't assume it's doing anything
+            # at the current num_quantizers=2 config.
             quantize_dropout=True,
             quantize_dropout_cutoff_index=1,
         )
@@ -218,6 +245,19 @@ class MotionVQVAE(nn.Module):
         quantized = self.quantizer.get_output_from_indices(token_ids)
         return self.decoder(quantized.permute(0, 2, 1))
 
+class _WindowDataset(Dataset):
+    """Wraps a list of (window_size, input_dim) numpy arrays without stacking them into
+    one big array upfront. Returns a 1-tuple per item, matching TensorDataset's calling
+    convention, so the training loop's `batch[0]` keeps working unchanged."""
+    def __init__(self, chunks: List[np.ndarray]):
+        self.chunks = chunks
+
+    def __len__(self) -> int:
+        return len(self.chunks)
+
+    def __getitem__(self, idx: int):
+        return (torch.from_numpy(self.chunks[idx]).float(),)
+
 # ==========================================
 # 3. Tokenizer Interface Wrapper
 # ==========================================
@@ -226,10 +266,37 @@ class VQVAETokenizer:
         self.device = device if torch.cuda.is_available() else "cpu"
         self.model = MotionVQVAE(codebook_size=n_clusters).to(self.device)
 
-    def fit(self, chunks: List[np.ndarray], epochs: int = 500, batch_size: int = 16) -> None:
-        dataset = torch.utils.data.TensorDataset(torch.tensor(np.array(chunks), dtype=torch.float32))
+    def fit(self, chunks: List[np.ndarray], epochs: int = 500, batch_size: int = 16,
+            checkpoint_path: str | Path | None = None, resume: bool = True) -> None:
+        # TensorDataset(torch.tensor(np.array(chunks))) stacks the whole corpus into one
+        # contiguous array THEN copies it again into a tensor — two full-corpus copies on
+        # top of the chunks list itself. Fine at 4-clip scale; measured at full Embody-3D
+        # scale (~90GB of windows) that briefly needs ~3x that (~270GB) just to build the
+        # dataset, on a machine with ~278GB RAM — enough to risk OOM before training even
+        # starts. _WindowDataset converts one chunk to a tensor per __getitem__ instead of
+        # stacking upfront, so peak memory stays ~1x the chunks list.
+        dataset = _WindowDataset(chunks)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=2e-4)
+
+        # Resumability: a crash/interruption mid-run, or simply deciding --epochs was too
+        # low after watching the loss curve, used to mean starting over from epoch 0 —
+        # everything (including the ~9,171-row disk load that got you here) had to be
+        # redone. This restores model + optimizer state and picks up where it left off.
+        # Only the epoch loop resumes this way — collect_dataset_from_csv/windowing in
+        # fit_tokenizer_from_csv below still reruns on every invocation; that's a much
+        # smaller cost (disk I/O, not GPU training) and out of scope here.
+        start_epoch = 0
+        if checkpoint_path is not None and resume and Path(checkpoint_path).exists():
+            ckpt = torch.load(checkpoint_path, map_location=self.device)
+            self.model.load_state_dict(ckpt["model_state_dict"])
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            start_epoch = ckpt["epoch"] + 1
+            print(f"Resuming from checkpoint: epoch {start_epoch} already done ({checkpoint_path})")
+            if start_epoch >= epochs:
+                print(f"Checkpoint already covers the requested {epochs} epochs — nothing to train. "
+                      f"Pass --epochs with a higher number to continue past it.")
+                return
 
         # Translation is only the last 3 of ~162 channels. Under a plain, unweighted
         # L1 sum it gets numerically drowned out by the other ~159 pose/hand
@@ -243,9 +310,10 @@ class VQVAETokenizer:
 
         self.model.train()
         print("Training VQ-VAE Codebook...")
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, epochs):
             total_loss = 0
-            for batch in dataloader:
+            pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+            for batch in pbar:
                 x = batch[0].permute(0, 2, 1).to(self.device) # (B, input_dim, T)
                 optimizer.zero_grad()
 
@@ -279,9 +347,22 @@ class VQVAETokenizer:
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
-                
-            if epoch % 50 == 0 or epoch == epochs - 1:
-                print(f"Epoch {epoch}/{epochs} | Loss: {total_loss/len(dataloader):.4f}")
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+            # Unconditional now — "every 50 epochs" made sense at 500 epochs (4-clip
+            # set) but would print at most twice at the handful of epochs a full-scale
+            # run actually uses. The per-batch tqdm bar above covers within-epoch
+            # progress; this is the persistent per-epoch record (tqdm's bar is cleared
+            # after each epoch via leave=False, so this is what survives in a log file).
+            print(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(dataloader):.4f}")
+
+            if checkpoint_path is not None:
+                Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": self.model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                }, checkpoint_path)
 
     def encode(self, motion: np.ndarray) -> np.ndarray:
         self.model.eval()
@@ -319,7 +400,7 @@ class VQVAETokenizer:
 def collect_dataset_from_csv(csv_path: str | Path) -> List[np.ndarray]:
     df = pd.read_csv(csv_path)
     all_data = []
-    for i, row in df.iterrows():
+    for i, row in tqdm(df.iterrows(), total=len(df), desc="Loading sequences"):
         try:
             motion = load_smplx_sequence(row["motion_dirname"])
             all_data.append(preprocess_motion(motion))
@@ -327,13 +408,25 @@ def collect_dataset_from_csv(csv_path: str | Path) -> List[np.ndarray]:
             print(f"Skipping row {i}: {e}")
     return all_data
 
-def fit_tokenizer_from_csv(csv_path: str | Path, save_dir: str | Path, n_clusters: int = 1024) -> None:
+def fit_tokenizer_from_csv(csv_path: str | Path, save_dir: str | Path, n_clusters: int = 1024,
+                            epochs: int = 500, batch_size: int = 16, resume: bool = True) -> None:
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+    # Auto-resumes from here if present (matching speech_to_motion_pipeline.py's LoRA
+    # stage, which auto-resumes from its latest checkpoint-N the same way) — pass
+    # resume=False (--restart on the CLI) to ignore it and start fresh instead.
+    checkpoint_path = save_dir / "train_checkpoint.pt"
 
+    # collect_dataset_from_csv loads every session's full sequence into a plain Python
+    # list before windowing — measured at ~18GB for the full Embody-3D CSV (~10,200
+    # rows). The windows built below are numpy VIEWS into those sequences (no per-window
+    # copy), and VQVAETokenizer.fit uses a lazy per-item Dataset instead of stacking the
+    # whole corpus into one array upfront, so this no longer needs multiples of that
+    # ~18GB just to build the training set. `sequences` itself is freed right after
+    # windowing (see `del sequences` below) once it's no longer needed.
     print("Loading dataset...")
     sequences = collect_dataset_from_csv(csv_path)
-    
+
     print("Fitting normalizer...")
     norm = Normalizer()
     norm.fit(np.concatenate(sequences, axis=0))
@@ -351,6 +444,10 @@ def fit_tokenizer_from_csv(csv_path: str | Path, save_dir: str | Path, n_cluster
             for i in range(0, T - window_size + 1, 30):
                 chunks.append(seq[i:i+window_size])
 
+    # seq[i:i+window_size] above is a numpy VIEW, not a copy, so this frees the raw
+    # (un-normalized) sequences without touching the normalized windows chunks holds.
+    del sequences
+
     # Clips are dominated by static/slow windows; brief dynamic bursts (walking,
     # large turns) land in only a few windows and get outvoted during training
     # even with per-frame loss weighting. Replicate high-energy windows so the
@@ -362,7 +459,8 @@ def fit_tokenizer_from_csv(csv_path: str | Path, save_dir: str | Path, n_cluster
     print(f"Windows: {len(energies)} base + {len(dynamic_chunks)}x2 high-energy oversamples")
 
     tokenizer = VQVAETokenizer(n_clusters=n_clusters)
-    tokenizer.fit(chunks)
+    tokenizer.fit(chunks, epochs=epochs, batch_size=batch_size,
+                  checkpoint_path=checkpoint_path, resume=resume)
 
     tokenizer.save(save_dir / "tokenizer.pt")
     norm.save(save_dir / "normalizer.npz")
@@ -379,7 +477,7 @@ def tokenize_csv_to_jsonl(csv_path: str | Path, save_dir: str | Path, output_jso
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
     with output_jsonl.open("w", encoding="utf-8") as f:
-        for i, row in df.iterrows():
+        for i, row in tqdm(df.iterrows(), total=len(df), desc="Tokenizing motion"):
             try:
                 motion = preprocess_motion(load_smplx_sequence(row["motion_dirname"]))
                 motion = norm.transform(motion)
@@ -404,11 +502,22 @@ if __name__ == "__main__":
     parser.add_argument("--csv_path", type=str, required=True)
     parser.add_argument("--save_dir", type=str, default="motion_tokenizer_artifacts")
     parser.add_argument("--n_clusters", type=int, default=1024)
+    # 500 epochs was tuned to converge fast on 4 clips (~500 windows/epoch). At full
+    # Embody-3D scale (~10,200 rows, tens of thousands of windows/epoch) 500 epochs
+    # is a vastly larger training budget than the tiny set ever ran — start well below
+    # this and watch the printed epoch loss rather than assuming 500 is still right.
+    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--restart", action="store_true",
+                        help="Ignore any existing <save_dir>/train_checkpoint.pt and start "
+                             "training from epoch 0, instead of auto-resuming from it.")
     parser.add_argument("--tokenize_jsonl", action="store_true")
     parser.add_argument("--output_jsonl", type=str, default="datasets/tokenized_data.jsonl")
     args = parser.parse_args()
 
-    fit_tokenizer_from_csv(args.csv_path, args.save_dir, args.n_clusters)
+    fit_tokenizer_from_csv(args.csv_path, args.save_dir, args.n_clusters,
+                            epochs=args.epochs, batch_size=args.batch_size,
+                            resume=not args.restart)
     
     if args.tokenize_jsonl:
         tokenize_csv_to_jsonl(args.csv_path, args.save_dir, args.output_jsonl)

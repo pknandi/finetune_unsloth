@@ -25,7 +25,7 @@ echo "Running with STAGE=$STAGE STOP_STAGE=$STOP_STAGE"
 # ==========================================
 # RUN + LOGGING
 # ==========================================
-RUN_NAME="run-overfit100-sep16"
+RUN_NAME="run-overfit100-tokfix-sep27"
 
 LOG_DIR="./outputs/terminal"
 LOG_FILE="$LOG_DIR/$(date '+%Y-%m-%d_%H-%M-%S').log"
@@ -90,7 +90,7 @@ SCENE_TYPES=""
 # a fixed row count via dataset_to_csv.py's --max_samples, to find the data scale where the
 # pipeline starts breaking down. Only takes effect when USE_FULL_DATASET=true.
 # "" = no cap (original full-dataset behavior, run-full-sep8's config).
-MAX_SAMPLES="100"   # next: change to "1000" (and RUN_NAME/hyperparams below) for the 2nd rung
+MAX_SAMPLES="100"
 
 # A capped subset drawn from every scene type would be a random grab-bag spanning ~7 very
 # different scenarios — that confounds "does scale break it" with "does diversity break
@@ -106,7 +106,34 @@ SCENE_TYPES_FLAG=""
 [ -n "$SCENE_TYPES" ] && SCENE_TYPES_FLAG="--scene_types $SCENE_TYPES"
 
 MAX_SAMPLES_FLAG=""
-[ -n "$MAX_SAMPLES" ] && MAX_SAMPLES_FLAG="--max_samples $MAX_SAMPLES"
+[ -n "$MAX_SAMPLES" ] && MAX_SAMPLES_FLAG="--max_samples $MAX_SAMPLES --force_session c--20250108--1300--DXG448--SZM479--JON169--BWW760--pilot--MotionPrior--ACTING_Adult_Birthday_--103301-106600"
+# --force_session guarantees the fixed inference clip below (BWW760) is always actually IN
+# the training set, regardless of the random sample -- see dataset_to_csv.py's comment.
+
+# RVQ levels per 2-frame motion block — must be the same in the tokenizer (STEP 2), the LLM
+# (STEP 5) and inference (STEP 6); passed to all three below. 2 is the default. Measured
+# reconstruction ceiling (GT tokens -> decode, same seed): 4 levels beat 2 by ~35-40% at
+# both 4-clip and 100-row scale, but the LLM couldn't learn the fine levels on the full
+# corpus, so 4 is for the memorization/overfit checks unless that changes.
+NUM_QUANTIZERS=4    # Tokenizer-only ceiling, same 26 windows, all other settings equal (root-relative
+                    # MPJPE mean/BWW760, mm): Q2 42.0/76.6, Q3 29.9/43.2, Q4 25.0/41.8. Each residual
+                    # level adds a tier of detail; more codes per level does not (see N_CLUSTERS).
+
+# Minimum RMS a row's best select_best_audio_window() window must clear to be kept in
+# STEP 4's JSONL — 0.0 (default) keeps everything, matching the original behavior before
+# per-row audio windowing existed. Only the "25)" case below overrides this; see its
+# comment for why 0.0002 specifically.
+MIN_WINDOW_RMS=0.0
+
+# true: pick each row's 10 s window BEFORE the tokenizer (STEP 2) and train the tokenizer on
+# those windows only, instead of whole clips; STEP 4 then builds the LLM examples from the same
+# windows file, so the two can't disagree. Whole-clip training gave the tokenizer 12x more motion
+# than the LLM ever sees (3180 s vs 260 s on the 25-row set) and its capacity went to frames that
+# are never scored: reconstruction error on the used windows fell from 114.7 to 44.8 mm
+# (root-relative MPJPE, same RVQ depth) just by restricting training to them. This is the right
+# setting for a memorization run; for a generalization run whole clips give broader coverage
+# (untested), so it stays false outside the "25)" case.
+TOK_ON_WINDOWS=false
 
 # Everything that differs between the two modes lives in this one branch — split across
 # separate variables further down used to mean flipping USE_FULL_DATASET but forgetting
@@ -152,15 +179,54 @@ if [ "$USE_FULL_DATASET" = true ]; then
     # rows =~ 19.7 passes, loss bottomed at 0.006) — scaled down for less data to cover per
     # step, not up, since fewer distinct examples should need less total exposure to memorize.
     case "$MAX_SAMPLES" in
+        25)
+            # Memorization check on 25 rows (BWW760's session forced in). Everything that made the
+            # earlier 25-row runs miss overfit4 was in the tokenizer, not the LLM: the LLM's output
+            # matched the tokenizer's own reconstruction ceiling to the millimetre every time. The
+            # tokenizer-only fixes (each measured, see the flags/comments they live next to):
+            #   - 6D rotations for root/body/hands (sin/cos on the root orient decodes to a different
+            #     rotation once its norm passes pi: +25 mm on the BWW760 target, +253 mm on GBM952)
+            #   - tokenizer trained on the LLM's own windows (TOK_ON_WINDOWS)
+            #   - finger channels weighted 0.3 (55% of input channels, 0% of the metric's joints)
+            # Ceiling on the 26 kept rows went 114.7 -> ~24 mm mean; BWW760 112 -> ~36-43 mm.
+            # overfit4's real LLM output, scored the same way, is 60.3 mm.
+            TEST_FRAC=0
+            TOK_EPOCHS=2000         # windows-only set is ~270 chunks/epoch (17 steps at batch 16)
+            TOK_BATCH_SIZE=16
+            TOK_ON_WINDOWS=true
+            MAX_STEPS=3200          # 1020 passes/row (overfit4's exposure): 1020*25/8 = 3187.5
+            SAVE_STEPS=400
+            FINAL_CHECKPOINT_STEP=3200
+            DECODE_FLAGS=""
+            # 0.0002: a clip whose loudest 10 s window is still under this is true silence
+            # throughout; reclipping cannot help (collapsed pairs sharing >50% identical audio
+            # tokens 143->24, >90% 20->1, on the other 26 rows).
+            MIN_WINDOW_RMS=0.0002
+            ;;
         100)
+            # Same tokenizer-only fixes validated at 25 rows (see that case's comment): 6D
+            # rotations, window-matched tokenizer training, finger weight 0.3 -- all apply here
+            # automatically (they're defaults, not scale-specific flags). Measured directly at
+            # this scale though (81 kept rows, same architecture/codebook): ceiling is real but
+            # meaningfully higher than at 25 rows -- mean 52.4mm / BWW760 63.6mm at 2000 epochs,
+            # vs ~25mm / ~42mm at 25 rows -- because 4x the distinct motion now shares the same
+            # 1024x4 codebook and 256-wide encoder/decoder. Loss plateaus noisily around 0.80-
+            # 0.85 well before 2000 epochs (1200ep: mean 56.9/BWW760 98.8; 2000ep: 52.4/63.6), so
+            # more epochs alone won't close this further -- untried next step would be more
+            # codebook/model capacity, which also needs the LLM's <m_q_i> vocabulary (currently
+            # 1024, see MOTION_VOCAB_SIZE) raised to match. Not attempted here; this config is
+            # "apply what's proven," not a new capacity fix.
             TEST_FRAC=0.15
-            TOK_EPOCHS=300      # tokenizer sees far fewer windows than the full run per
-            TOK_BATCH_SIZE=32   # epoch, so needs more epochs to reach the same loss plateau
-            MAX_STEPS=800        # eff. batch 8 -> ~64 passes over 100 rows (over-provisioned
-            SAVE_STEPS=100        # vs. acting-sep2's ~20, on purpose: this run's whole point
-            FINAL_CHECKPOINT_STEP=800  # is to unambiguously see memorization happen)
+            TOK_EPOCHS=2000
+            TOK_BATCH_SIZE=32
+            TOK_ON_WINDOWS=true
+            MIN_WINDOW_RMS=0.0002
+            MAX_STEPS=800        # eff. batch 8 -> ~64 passes over 100 rows; teacher-forced
+            SAVE_STEPS=100        # accuracy was already 99.8-100% at this budget pre-fix, so
+            FINAL_CHECKPOINT_STEP=800  # LLM capacity was never the bottleneck here, only the tokenizer was.
             ;;
         1000)
+            MIN_WINDOW_RMS=0.0
             TEST_FRAC=0.1
             TOK_EPOCHS=60
             TOK_BATCH_SIZE=64
@@ -192,18 +258,27 @@ TOK_ROOT_FOLDER="$DATASET_ROOT"                                       # Tokenize
 TOK_CSV="./outputs/$RUN_NAME/tokenizer_dataset_mapping.csv"          # audio_filename,motion_dirname
 TOK_SAVE_DIR="./outputs/$RUN_NAME/motion_tokenizer_artifacts"        # tokenizer.pkl + normalizer.npz
 
-N_CLUSTERS=1024                                                       # Motion token vocabulary size
+N_CLUSTERS=1024                                                       # must equal the LLM's <m_q_i> vocabulary (MOTION_VOCAB_SIZE in
+                                                                      # speech_to_motion_pipeline.py; STEP 4 refuses anything else).
+                                                                      # 2048 codes gave the same ceiling as 1024 (24.7 vs 24.1 mm mean).
 # TOK_EPOCHS / TOK_BATCH_SIZE are set above in the USE_FULL_DATASET branch.
 
 TRAIN_ROOT_FOLDER="$DATASET_ROOT"                                     # LLM training dataset
 TRAIN_CSV="./outputs/$RUN_NAME/training_dataset_mapping.csv"         # Training dataset CSV (held-out sessions land in a sibling _test.csv when TEST_FRAC > 0)
 TRAIN_CSV_TEST="${TRAIN_CSV%.csv}_test.csv"                          # Defined here (not just before STEP 6) so STEP 4 can build a validation JSONL from it too
 TRAIN_JSONL="./outputs/$RUN_NAME/speech_motion_train.jsonl"          # Final tokenized dataset
+WINDOWS_CSV="./outputs/$RUN_NAME/audio_windows.csv"                  # Per-row 10 s windows, written by STEP 2 when TOK_ON_WINDOWS=true
+TOK_WINDOWS_FLAG=""
+TRAIN_WINDOWS_FLAG=""
+if [ "$TOK_ON_WINDOWS" = true ]; then
+    TOK_WINDOWS_FLAG="--windows_csv $WINDOWS_CSV"
+    TRAIN_WINDOWS_FLAG="--windows_csv $WINDOWS_CSV"
+fi
 VAL_JSONL="./outputs/$RUN_NAME/speech_motion_val.jsonl"              # Held-out validation JSONL — see STEP 4/5 and finetune()'s eval_dataset comment
 
 OUTPUT_DIR="./outputs/$RUN_NAME/lora"                                # LoRA checkpoints
 BASE_MODEL="unsloth/llama-3-8b-bnb-4bit"                             # Base model
-OPTIMIZER="muon"                                                     # muon (LoRA 2D matrices on Muon, embed_tokens/lm_head on AdamW) or "adamw" to revert
+OPTIMIZER="adamw"                                                    # muon has a known lr-scale defect (see _step_muon) — adamw is the setting that overfit before
 
 # MAX_STEPS / SAVE_STEPS are set above in the USE_FULL_DATASET branch (effective batch =
 # 1 x grad_accum(8) = 8). finetune() (speech_to_motion_pipeline.py) auto-resumes from the
@@ -258,12 +333,21 @@ fi
 if [ "$STAGE" -le 2 ] && [ "$STOP_STAGE" -ge 2 ]; then
     echo -e "\n${YELLOW}=> [2/9] Training Motion Tokenizer...${NC}"
 
+    if [ "$TOK_ON_WINDOWS" = true ]; then
+        python3 speech_to_motion_pipeline.py --select_windows \
+            --csv_path $TOK_CSV \
+            --output_windows_csv $WINDOWS_CSV \
+            --min_window_rms $MIN_WINDOW_RMS
+    fi
+
     python3 vqvae_motion_tokenizer.py \
         --csv_path $TOK_CSV \
         --save_dir $TOK_SAVE_DIR \
         --n_clusters $N_CLUSTERS \
         --epochs $TOK_EPOCHS \
         --batch_size $TOK_BATCH_SIZE \
+        --num_quantizers $NUM_QUANTIZERS \
+        $TOK_WINDOWS_FLAG \
         --tokenize_jsonl
 fi
 
@@ -291,7 +375,9 @@ if [ "$STAGE" -le 4 ] && [ "$STOP_STAGE" -ge 4 ]; then
         --csv_path $TRAIN_CSV \
         --tokenizer_path "$TOK_SAVE_DIR/tokenizer.pt" \
         --normalizer_path "$TOK_SAVE_DIR/normalizer.npz" \
-        --output_jsonl $TRAIN_JSONL
+        --output_jsonl $TRAIN_JSONL \
+        --min_window_rms $MIN_WINDOW_RMS \
+        $TRAIN_WINDOWS_FLAG
 
     # Held-out validation JSONL, from the same *_test.csv split dataset_to_csv.py already
     # produces when TEST_FRAC > 0 — built here too so STEP 5 can pass it as eval_dataset.
@@ -301,7 +387,8 @@ if [ "$STAGE" -le 4 ] && [ "$STOP_STAGE" -ge 4 ]; then
             --csv_path $TRAIN_CSV_TEST \
             --tokenizer_path "$TOK_SAVE_DIR/tokenizer.pt" \
             --normalizer_path "$TOK_SAVE_DIR/normalizer.npz" \
-            --output_jsonl $VAL_JSONL
+            --output_jsonl $VAL_JSONL \
+            --min_window_rms $MIN_WINDOW_RMS
     fi
 fi
 
@@ -326,6 +413,7 @@ if [ "$STAGE" -le 5 ] && [ "$STOP_STAGE" -ge 5 ]; then
         --save_steps $SAVE_STEPS \
         --run_name "$RUN_NAME" \
         --optimizer $OPTIMIZER \
+        --num_quantizers $NUM_QUANTIZERS \
         $VAL_JSONL_FLAG
 
     echo -e "${GREEN}Model saved to: $OUTPUT_DIR${NC}"
@@ -347,17 +435,24 @@ fi
 # file.
 if [ "$STOP_STAGE" -ge 6 ]; then
     if [ "$USE_FULL_DATASET" = true ]; then
-        # TRAIN_CSV_TEST is defined earlier now (alongside TRAIN_CSV) so STEP 4 can also use it.
-        if [ -f "$TRAIN_CSV_TEST" ]; then
-            # Most-dynamic held-out row (by select_inference_sample.py's motion score), not
-            # just whichever one happened to land first in the CSV — that used to pick
-            # whatever row the shuffle put first regardless of content, which on the
-            # 100-sample overfit run landed on a near-static clip with nothing to visually
-            # compare against. Still a held-out session/subject the model never trained on,
-            # so this stays a real generalization test, the whole point of
-            # USE_FULL_DATASET. Layout-agnostic because it reads paths dataset_to_csv.py
-            # already resolved, rather than reconstructing them (full_dataset's merged
-            # layout has no top-level audio/ or smplx/ split the way sample_dataset's does).
+        if [ -n "$MAX_SAMPLES" ]; then
+            # MAX_SAMPLES set == OVERFIT-SCALE SWEEP run: fixed to BWW760's clip every time
+            # (same session/subject the sample_dataset branch below uses) so every overfit
+            # run — 4 clips, 100 rows, 1000 rows — is scored against the SAME ground truth.
+            # Previously this called select_inference_sample.py to auto-pick the
+            # most-dynamic row in whatever got randomly sampled, which meant runs at
+            # different scales were being graded on different, non-comparable clips (the
+            # 100-row run's pick was 2x more dynamic by that same score than BWW760 — see
+            # run-overfit100-q4-sep20 vs run-overfit4-adamw-sep19). --force_session above
+            # guarantees BWW760 is actually IN the training set, so this stays a real
+            # memorization check, not accidental generalization.
+            SESSION_NAME="c--20250108--1300--DXG448--SZM479--JON169--BWW760--pilot--MotionPrior--ACTING_Adult_Birthday_--103301-106600"
+            GT_SUBJECT="BWW760"
+            GT_SESSION_DIR="${DATASET_ROOT}/acting/${SESSION_NAME}"
+            INFERENCE_AUDIO="${DATASET_ROOT}/acting/${SESSION_NAME}/${GT_SUBJECT}/audio_separated/${SESSION_NAME}.wav"
+        elif [ -f "$TRAIN_CSV_TEST" ]; then
+            # No cap (the real full run): held-out generalization test, most-dynamic row in
+            # the held-out pool so there's something to see in the comparison video.
             read -r INFERENCE_AUDIO GT_SUBJECT GT_SESSION_DIR SESSION_NAME < <(python3 select_inference_sample.py --csv_path "$TRAIN_CSV_TEST")
         else
             echo -e "${YELLOW}Warning: $TRAIN_CSV_TEST still doesn't exist (STAGE=3 hasn't run, in this invocation or a prior one) — STAGE>=6 needs it and will fail without it.${NC}"
@@ -375,6 +470,29 @@ if [ "$STOP_STAGE" -ge 6 ]; then
 
     AUDIO_FILE_NAME=$(basename "${INFERENCE_AUDIO:-unknown.wav}")
     AUDIO_BASENAME=$(basename "$AUDIO_FILE_NAME" .wav)
+
+    # If STEP 4 windowed this clip to something other than [0, max_duration_sec) (see
+    # select_best_audio_window / MIN_WINDOW_RMS above), inference and eval must use that
+    # exact same window or they'd condition on / score against the wrong 10s. 0.0 (i.e. no
+    # windowing happened, or the sidecar doesn't exist yet) reproduces the old behavior.
+    AUDIO_WINDOWS_CSV="${TRAIN_JSONL%.jsonl}_audio_windows.csv"
+    AUDIO_START_SEC="0.0"
+    if [ -f "$AUDIO_WINDOWS_CSV" ] && [ -n "$INFERENCE_AUDIO" ]; then
+        # os.path.normpath, not a straight string match: dataset_to_csv.py writes paths
+        # via pathlib (str(Path("./full_dataset/...")) drops the leading "./"), while
+        # INFERENCE_AUDIO here is built by plain bash concatenation (keeps it) -- an exact
+        # string compare silently never matches and always falls back to 0.0.
+        AUDIO_START_SEC=$(python3 -c "
+import csv, os
+target = os.path.normpath('$INFERENCE_AUDIO')
+with open('$AUDIO_WINDOWS_CSV') as f:
+    for row in csv.DictReader(f):
+        if os.path.normpath(row['audio_filename']) == target:
+            print(row['start_sec']); break
+    else:
+        print('0.0')
+")
+    fi
 
     BASE_MODEL_SLUG=$(echo "$BASE_MODEL" | sed 's/[^a-zA-Z0-9]/_/g' | sed 's/_\+/_/g' | sed 's/^_\|_$//g')
 
@@ -403,6 +521,8 @@ if [ "$STAGE" -le 6 ] && [ "$STOP_STAGE" -ge 6 ]; then
         --normalizer_path "$TOK_SAVE_DIR/normalizer.npz" \
         --base_model $BASE_MODEL \
         --output_npy_path $INFERENCE_OUTPUT \
+        --num_quantizers $NUM_QUANTIZERS \
+        --start_sec $AUDIO_START_SEC \
         $DECODE_FLAGS
 
     echo -e "${GREEN}Motion output saved to: $INFERENCE_OUTPUT${NC}"
@@ -441,7 +561,8 @@ if [ "$STAGE" -le 8 ] && [ "$STOP_STAGE" -ge 8 ]; then
         --width       1280 \
         --height      540 \
         --elev        15 \
-        --azim        -60
+        --azim        -60 \
+        --gt_start_sec $AUDIO_START_SEC
 
     echo -e "\n${GREEN}=> Comparison video: $COMPARISON_VIDEO${NC}"
 fi
@@ -462,6 +583,7 @@ if [ "$STAGE" -le 9 ] && [ "$STOP_STAGE" -ge 9 ]; then
         --smplx_model_dir "$SMPLX_MODEL_DIR" \
         --fps         30 \
         --max_seconds 10.0 \
+        --gt_start_sec $AUDIO_START_SEC \
         --output_json "$METRICS_JSON"
 
     echo -e "\n${GREEN}=> Metrics saved: $METRICS_JSON${NC}"

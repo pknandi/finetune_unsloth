@@ -70,7 +70,7 @@ from typing import Optional
 import librosa
 import numpy as np
 
-from compare_motion import load_gt_motion, load_pred_motion, _resample, _resample_mask
+from compare_motion import load_gt_motion, load_gt_betas, load_pred_motion, _resample, _resample_mask
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -210,7 +210,15 @@ def print_report(metrics: dict) -> None:
     print(f"MPJPE                 : {metrics['mpjpe_mm']:.1f} mm")
     for alpha, pct in metrics["pck"].items():
         print(f"PCK@{alpha:<4g}            : {100*pct:.1f}%")
-    print(f"\n-- Motion dynamics --")
+    rr = metrics.get("root_relative")
+    if rr:
+        print(f"\n-- Root-relative (global translation removed: pose only) --")
+        print(f"MPJPE                 : {rr['mpjpe_mm']:.1f} mm")
+        for alpha, pct in rr["pck"].items():
+            print(f"PCK@{alpha:<4g}            : {100*pct:.1f}%")
+        print(f"Velocity L2 error     : {rr['dynamics']['velocity_l2_error_m_per_s']:.4f} m/s   "
+              f"Jerk ratio pred/GT = {rr['dynamics']['jerk_ratio_pred_over_gt']:.2f}")
+    print(f"\n-- Motion dynamics (absolute) --")
     d = metrics["dynamics"]
     print(f"Velocity L2 error     : {d['velocity_l2_error_m_per_s']:.4f} m/s")
     print(f"Acceleration L2 error : {d['acceleration_l2_error_m_per_s2']:.4f} m/s^2")
@@ -239,6 +247,7 @@ def evaluate(
     max_seconds: float = 10.0,
     pck_thresholds: Optional[list[float]] = None,
     beat_sigma: float = DEFAULT_BEAT_SIGMA,
+    gt_start_sec: float = 0.0,
 ) -> dict:
     pck_thresholds = pck_thresholds or DEFAULT_PCK_THRESHOLDS
 
@@ -248,10 +257,15 @@ def evaluate(
     gt_joints, missing_mask = load_gt_motion(session_dir, subject, smplx_model_dir)
 
     log.info("Loading prediction ...")
-    pred_joints = load_pred_motion(pred_npy, smplx_model_dir)
+    pred_joints = load_pred_motion(pred_npy, smplx_model_dir, betas=load_gt_betas(session_dir, subject))
 
+    # gt_start_sec must match whatever window this clip's TRAINING row actually used (see
+    # <jsonl-stem>_audio_windows.csv) -- comparing against frame 0 when the model trained
+    # on, say, seconds [61, 71) would silently score the wrong 10s of ground truth.
+    gt_start_frame = round(fps * gt_start_sec)
     max_frames = int(fps * max_seconds)
-    gt_joints, missing_mask = gt_joints[:max_frames], missing_mask[:max_frames]
+    gt_joints = gt_joints[gt_start_frame: gt_start_frame + max_frames]
+    missing_mask = missing_mask[gt_start_frame: gt_start_frame + max_frames]
     pred_joints = pred_joints[:max_frames]
 
     T = max(len(gt_joints), len(pred_joints))
@@ -269,6 +283,20 @@ def evaluate(
     mpjpe_m, mpjpe_mm = compute_mpjpe(gt_r, pred_r, valid_mask)
     pck = compute_pck(gt_r, pred_r, valid_mask, pck_thresholds)
     dynamics = compute_dynamics(gt_r, pred_r, valid_mask, fps)
+
+    # Root-relative: subtract each frame's root joint (index 0) from BOTH skeletons, so global
+    # position drops out and only body pose is scored — the usual protocol for co-speech
+    # gesture (a speaker's walking path isn't determined by what they say). The absolute
+    # numbers above stay as they were; this is the number to read when the model holds the
+    # root fixed, or when translation quality shouldn't mask pose quality (on the overfit
+    # runs, decoded root translation alone was ~60-90% of the absolute MPJPE).
+    gt_rel = gt_r - gt_r[:, :1, :]
+    pred_rel = pred_r - pred_r[:, :1, :]
+    root_relative = {
+        "mpjpe_mm": compute_mpjpe(gt_rel, pred_rel, valid_mask)[1],
+        "pck": compute_pck(gt_rel, pred_rel, valid_mask, pck_thresholds),
+        "dynamics": compute_dynamics(gt_rel, pred_rel, valid_mask, fps),
+    }
 
     beat_consistency = {"audio_beats": None, "gt_motion_beats": None,
                          "pred_motion_beats": None, "bc_gt": None, "bc_pred": None}
@@ -294,6 +322,7 @@ def evaluate(
         "mpjpe_mm": mpjpe_mm,
         "pck": pck,
         "dynamics": dynamics,
+        "root_relative": root_relative,
         "beat_consistency": beat_consistency,
     }
     return metrics
@@ -320,6 +349,10 @@ if __name__ == "__main__":
                         help="Comma-separated alpha values, as a fraction of shoulder width.")
     parser.add_argument("--beat_sigma", type=float, default=DEFAULT_BEAT_SIGMA,
                         help="Gaussian sigma (seconds) for the Beat Consistency kernel.")
+    parser.add_argument("--gt_start_sec", type=float, default=0.0,
+                        help="Score against ground-truth seconds [gt_start_sec, gt_start_sec+max_seconds) "
+                             "instead of [0, max_seconds) -- must match the training row's actual "
+                             "audio window (see build_joint_jsonl's <jsonl-stem>_audio_windows.csv).")
     parser.add_argument("--output_json", type=str, default=None,
                         help="Where to save the metrics as JSON.")
 
@@ -336,6 +369,7 @@ if __name__ == "__main__":
         max_seconds=args.max_seconds,
         pck_thresholds=thresholds,
         beat_sigma=args.beat_sigma,
+        gt_start_sec=args.gt_start_sec,
     )
     print_report(metrics)
 

@@ -79,6 +79,7 @@ def generate_dataset_csv(
     test_frac: float = 0.0,
     seed: int = 42,
     max_samples: Optional[int] = None,
+    force_session: Optional[str] = None,
 ):
     root_path = Path(root_folder)
     if not root_path.exists():
@@ -118,6 +119,14 @@ def generate_dataset_csv(
         sessions = list(by_session.keys())
         rng = random.Random(seed)
         rng.shuffle(sessions)
+
+        if force_session is not None and force_session in by_session:
+            # The overfit-scale sweep's inference target must land in the same training
+            # set every time -- see run.sh's INFERENCE CONFIG (fixed to BWW760's session)
+            # -- else which clip the model was even trained on becomes a coin flip on the
+            # random sample, silently turning a memorization check into a generalization
+            # test some of the time.
+            sessions = [force_session] + [s for s in sessions if s != force_session]
 
         capped_rows: list[dict] = []
         for s in sessions:
@@ -171,6 +180,10 @@ if __name__ == "__main__":
                              "of training and testing on the same session. 0 disables it "
                              "(single combined CSV, same behavior as before).")
     parser.add_argument("--seed", type=int, default=42, help="Shuffle seed for --test_frac and --max_samples.")
+    parser.add_argument("--force_session", type=str, default=None,
+                        help="Always include this session in a --max_samples cap (if present in "
+                             "the scanned data), regardless of the random sample -- so a fixed "
+                             "inference clip is guaranteed to be in the training set every run.")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Cap the dataset to roughly this many rows, selected by whole "
                              "SESSION (shuffled by --seed) so the subset stays coherent "
@@ -186,4 +199,5 @@ if __name__ == "__main__":
         test_frac=args.test_frac,
         seed=args.seed,
         max_samples=args.max_samples,
+        force_session=args.force_session,
     )

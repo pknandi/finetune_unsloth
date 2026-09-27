@@ -5,6 +5,7 @@ import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ''
 
 import argparse
+import csv
 import json
 from pathlib import Path
 import numpy as np
@@ -22,11 +23,88 @@ from transformers import TrainingArguments, Trainer, default_data_collator
 # IMPORT THE NEW ARCHITECTURE
 from vqvae_motion_tokenizer import VQVAETokenizer, Normalizer, load_smplx_sequence, preprocess_motion
 
+# Body channels within the raw 162-dim motion vector -- global_orient(3) is excluded (it's
+# root facing direction, dominated by turning rather than gesture) and transl(3) is
+# excluded (root position, scored/handled separately everywhere else in this pipeline);
+# this mirrors select_inference_sample.py's motion_score, which this reuses the idea of.
+_MOTION_BODY_SLICE = slice(3, 159)  # global_orient excluded, body_pose+hands included, transl excluded
+
 # =========================
 # 1) Audio tokenization with EnCodec
 # =========================
+def select_best_audio_window(audio_path: str | Path, motion_dirname: str | Path, window_sec: float,
+                              hop_sec: float = 1.0, min_rms: float = 0.0) -> tuple[float, float, float]:
+    """Scans the WHOLE clip for the window_sec-long span to condition training on, instead
+    of always keeping seconds [0, window_sec). Two separate problems, two criteria:
+      1. Many Embody-3D rows are silent or near-silent for their first window_sec (measured:
+         7.5% of the acting scenario's rows are digitally silent for the whole clip, 23.5%
+         are within 0.002 RMS of it) while their ground-truth motion is unrelated to that
+         silence — training on a fixed [0, window_sec) slice then maps many different,
+         unrelated motions to near-identical (near-silent) audio prompts, which isn't
+         memorizable because it isn't a function (see run-overfit25-sep22's diagnosis).
+         Fix: audio RMS must clear min_rms — a hard gate, not a ranking signal.
+      2. Among windows that clear the gate, picking by audio RMS alone can still land on a
+         window with almost no BODY movement (measured on a real case: the window with the
+         loudest audio had body-motion energy 47% of that same clip's own average, and was
+         among the lowest of any window in the whole 110s clip) — audio loudness and
+         gesture expressiveness are just different signals. Fix: rank qualifying windows by
+         motion energy (mirrors select_inference_sample.py's motion_score), not audio RMS.
+    Returns (start_sec, rms, motion_energy) of the chosen window. If NO window clears
+    min_rms, falls back to the single loudest one regardless (so the caller's own
+    min_rms-vs-returned-rms check still decides whether to skip the row — this function
+    always returns its honest best answer, it doesn't silently skip on the row's behalf).
+    If the whole clip is shorter than window_sec, returns (0.0, whole-clip rms, whole-clip
+    motion energy) since there is nothing to choose between.
+    """
+    wav_np, sr = sf.read(str(audio_path), dtype="float32")
+    if wav_np.ndim > 1:
+        wav_np = wav_np.mean(axis=1)
+    win_samples = int(window_sec * sr)
+    motion = load_smplx_sequence(motion_dirname)[:, _MOTION_BODY_SLICE]
+    motion_fps_raw = 30
+
+    if len(wav_np) <= win_samples:
+        rms = float(np.sqrt(np.mean(wav_np.astype(np.float64) ** 2))) if len(wav_np) else 0.0
+        energy = float(np.abs(np.diff(motion, axis=0)).mean()) if len(motion) > 1 else 0.0
+        return 0.0, rms, energy
+
+    hop_samples = max(1, int(hop_sec * sr))
+    starts = np.arange(0, len(wav_np) - win_samples + 1, hop_samples)
+    # Framed view + one vectorized RMS pass instead of a python loop per candidate window —
+    # matters at full-corpus scale (thousands of rows, some clips 300s+).
+    frames = np.lib.stride_tricks.sliding_window_view(wav_np, win_samples)[starts].astype(np.float64)
+    rms_per_start = np.sqrt((frames ** 2).mean(axis=1))
+
+    win_frames = int(window_sec * motion_fps_raw)
+    motion_starts = np.round(starts / sr * motion_fps_raw).astype(int)
+    motion_starts = np.clip(motion_starts, 0, max(0, len(motion) - win_frames))
+    energy_per_start = np.empty(len(starts))
+    for k, mstart in enumerate(motion_starts):
+        seg = motion[mstart: mstart + win_frames]
+        energy_per_start[k] = np.abs(np.diff(seg, axis=0)).mean() if len(seg) > 1 else 0.0
+
+    # Gate = max(min_rms, this clip's own median candidate RMS), not min_rms alone: ranking
+    # by motion energy among EVERY window that merely clears min_rms measurably reintroduced
+    # the audio-collision problem this function exists to prevent (measured: pairs sharing
+    # >90% identical audio tokens went 1->8 across a real 26-row set once "must clear
+    # min_rms" was the only audio requirement) — because a window can have loud MOTION
+    # during comparatively quiet, less-distinctive speech, and multiple rows tended to pick
+    # such windows. Requiring above-this-clip's-own-median RMS too (still ranking by motion
+    # energy among what qualifies) recovered most of the distinctiveness (8->4 pairs >90%
+    # match) while keeping motion energy nearly as high (0.0125->0.0115 mean, both far above
+    # the audio-only pick's 0.0047 on the case this was diagnosed from).
+    gate = max(min_rms, float(np.percentile(rms_per_start, 50)))
+    qualifying = rms_per_start >= gate
+    if qualifying.any():
+        candidates = np.where(qualifying)[0]
+        best = candidates[np.argmax(energy_per_start[candidates])]
+    else:
+        best = int(np.argmax(rms_per_start))
+    return float(starts[best] / sr), float(rms_per_start[best]), float(energy_per_start[best])
+
+
 def tokenize_audio_encodec(audio_path: str | Path, bandwidth: float = 6.0, model: EncodecModel = None,
-                            max_duration_sec: float | None = None) -> np.ndarray:
+                            max_duration_sec: float | None = None, start_sec: float = 0.0) -> np.ndarray:
     # model is optional only for backward compatibility (e.g. one-off scripts calling
     # this directly). build_joint_jsonl below always passes a shared instance — building
     # a fresh EncodecModel per call is fine for a handful of rows but reconstructs the
@@ -38,13 +116,16 @@ def tokenize_audio_encodec(audio_path: str | Path, bandwidth: float = 6.0, model
 
     wav_np, sr = sf.read(str(audio_path), dtype="float32")
     if max_duration_sec is not None:
-        # Embody-3D clips run 35s-300s+ (measured); build_joint_jsonl only ever keeps the
-        # first max_duration_sec of tokens anyway (see valid_sec below), so encoding the
+        # Embody-3D clips run 35s-300s+ (measured); build_joint_jsonl only ever keeps
+        # max_duration_sec worth of tokens anyway (see valid_sec below), so encoding the
         # full file was pure waste — one 300s clip took as long as EnCodec-encoding thirty
         # 10s ones. Slicing axis 0 (samples) works whether wav_np is mono (samples,) or
-        # multi-channel (samples, channels) per soundfile's layout. A no-op for anything
-        # already shorter than max_duration_sec.
-        wav_np = wav_np[: int(sr * max_duration_sec)]
+        # multi-channel (samples, channels) per soundfile's layout. start_sec=0.0 (default)
+        # reproduces the old fixed-start behavior exactly; build_joint_jsonl passes
+        # select_best_audio_window's result instead. A no-op for anything already shorter
+        # than max_duration_sec starting from start_sec.
+        start_sample = int(sr * start_sec)
+        wav_np = wav_np[start_sample: start_sample + int(sr * max_duration_sec)]
     wav = torch.from_numpy(wav_np).t()
     if wav.ndim == 1:
         wav = wav.unsqueeze(0)
@@ -72,9 +153,40 @@ def motion_tokens_to_text(tokens: np.ndarray) -> str:
     T, Q = tokens.shape
     return "".join(f"<m_{q}_{int(tokens[t, q])}>" for t in range(T) for q in range(Q)) # NO SPACES
 
+def select_windows_to_csv(csv_path: str | Path, output_csv: str | Path, window_sec: float = 10.0,
+                          min_window_rms: float = 0.0) -> None:
+    """Runs select_best_audio_window on every row of csv_path and writes the kept rows'
+    windows to output_csv (audio_filename,start_sec,rms,motion_energy). This is the ONE place a
+    row's window is decided: the motion tokenizer trains on exactly these windows and
+    build_joint_jsonl builds the LLM's examples from exactly these windows (--windows_csv), so the
+    two can't drift apart. Rows whose best window is still below min_window_rms are left out."""
+    df = pd.read_csv(csv_path)
+    kept, skipped = [], 0
+    for i, row in tqdm(df.iterrows(), total=len(df), desc="Selecting windows"):
+        try:
+            start_sec, rms, energy = select_best_audio_window(
+                row["audio_filename"], row["motion_dirname"], window_sec=window_sec, min_rms=min_window_rms)
+        except Exception as e:
+            print(f"Skipping row {i}: {e}")
+            continue
+        if rms < min_window_rms:
+            skipped += 1
+            print(f"Skipping row {i}: best {window_sec}s window RMS={rms:.5f} < min_window_rms={min_window_rms}")
+            continue
+        kept.append((row["audio_filename"], round(start_sec, 3), round(rms, 5), round(energy, 5)))
+    output_csv = Path(output_csv)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with output_csv.open("w", newline="", encoding="utf-8") as wf:
+        writer = csv.writer(wf)
+        writer.writerow(["audio_filename", "start_sec", "rms", "motion_energy"])
+        writer.writerows(kept)
+    print(f"{len(kept)} rows kept, {skipped} skipped as silent -> {output_csv}")
+
 # =========================
 # 2) Build training JSONL
 # =========================
+MOTION_VOCAB_SIZE = 1024  # <m_q_i> tokens defined per level by add_discrete_tokens; the motion codebook must match
+
 def build_joint_jsonl(
     csv_path: str | Path,
     tokenizer_path: str | Path,
@@ -82,13 +194,24 @@ def build_joint_jsonl(
     output_jsonl: str | Path,
     audio_bandwidth: float = 6.0,
     max_duration_sec: float = 10.0,
+    min_window_rms: float = 0.0,
+    windows_csv: str | Path | None = None,
 ):
     df = pd.read_csv(csv_path)
 
     motion_tok = VQVAETokenizer()
     motion_tok.load(tokenizer_path)
+    if motion_tok.n_clusters != MOTION_VOCAB_SIZE:
+        raise ValueError(f"motion codebook has {motion_tok.n_clusters} codes but the LLM vocabulary only "
+                         f"defines <m_q_i> for i < {MOTION_VOCAB_SIZE}; codes above that would be tokenized "
+                         f"as plain text. Train the tokenizer with --n_clusters {MOTION_VOCAB_SIZE}.")
     norm = Normalizer()
     norm.load(normalizer_path)
+    precomputed = None
+    if windows_csv:
+        w = pd.read_csv(windows_csv)
+        precomputed = {os.path.normpath(a): (float(s), float(r), float(e))
+                       for a, s, r, e in zip(w["audio_filename"], w["start_sec"], w["rms"], w["motion_energy"])}
 
     # Built once and reused for every row — see the comment on tokenize_audio_encodec.
     encodec_model = EncodecModel.encodec_model_24khz()
@@ -105,15 +228,45 @@ def build_joint_jsonl(
     audio_fps = 75
     motion_fps = 15  # VQVAE 2x Compression (30 / 2)
     audio_to_motion_ratio = int(audio_fps // motion_fps)  # 5
+    motion_fps_raw = 30  # load_smplx_sequence's native rate, before the VQ-VAE's 2x downsample —
+                          # used below to convert the audio window's start_sec into a frame offset.
 
+    skipped_silent = 0
+    windows_log = []  # (audio_filename, start_sec, rms, motion_energy) — written as a sidecar
+                       # CSV below so inference/eval can look up and reuse the exact window a
+                       # given clip got.
     with output_jsonl.open("w", encoding="utf-8") as f:
         for i, row in tqdm(df.iterrows(), total=len(df), desc="Building joint JSONL"):
             try:
-                audio_codes = tokenize_audio_encodec(row["audio_filename"], model=encodec_model,
-                                                      max_duration_sec=max_duration_sec)
+                if precomputed is not None:
+                    key = os.path.normpath(row["audio_filename"])
+                    if key not in precomputed:
+                        skipped_silent += 1
+                        print(f"Skipping row {i}: no window in {windows_csv} (dropped by the window step)")
+                        continue
+                    start_sec, rms, motion_energy = precomputed[key]
+                else:
+                    start_sec, rms, motion_energy = select_best_audio_window(
+                        row["audio_filename"], row["motion_dirname"], window_sec=max_duration_sec,
+                        min_rms=min_window_rms)
+                if rms < min_window_rms:
+                    # Reclipping only helps if the clip has real sound *somewhere* — a fully
+                    # silent row still maps to a near-silent prompt no matter which window is
+                    # picked, so it still isn't memorizable and still collides with other silent
+                    # rows (see select_best_audio_window's docstring). Excluded, not zero-padded.
+                    skipped_silent += 1
+                    print(f"Skipping row {i}: best {max_duration_sec}s window RMS={rms:.5f} < min_window_rms={min_window_rms}")
+                    continue
 
-                motion = load_smplx_sequence(row["motion_dirname"])
-                motion = preprocess_motion(motion)
+                audio_codes = tokenize_audio_encodec(row["audio_filename"], model=encodec_model,
+                                                      max_duration_sec=max_duration_sec, start_sec=start_sec)
+
+                frame_offset = round(start_sec * motion_fps_raw)
+                motion = load_smplx_sequence(row["motion_dirname"])[frame_offset:]
+                # preprocess_motion makes translation relative to THIS array's frame 0 — slicing
+                # before calling it is what makes that "frame 0" the chosen window's start, not
+                # the clip's start, so the representation stays correct for the shifted window.
+                motion = preprocess_motion(motion, norm.orient_repr, norm.pose_repr)
                 motion = norm.transform(motion)
                 motion_codes = motion_tok.encode(motion)
 
@@ -125,7 +278,7 @@ def build_joint_jsonl(
                 raw_a_frames = int(valid_sec * audio_fps)
                 max_a_frames = (raw_a_frames // audio_to_motion_ratio) * audio_to_motion_ratio
                 max_m_frames = max_a_frames // audio_to_motion_ratio
-                
+
                 audio_codes = audio_codes[:, :max_a_frames]
                 motion_codes = motion_codes[:max_m_frames]
 
@@ -133,10 +286,23 @@ def build_joint_jsonl(
                     "id": str(i),
                     "prompt": f"<|audio|>{audio_tokens_to_text(audio_codes)}<|motion|>",
                     "completion": motion_tokens_to_text(motion_codes),
+                    "audio_start_sec": round(start_sec, 3),
                 }
                 f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                windows_log.append((row["audio_filename"], round(start_sec, 3), round(rms, 5), round(motion_energy, 5)))
             except Exception as e:
                 print(f"Skipping row {i}: {e}")
+
+    if skipped_silent:
+        print(f"Skipped {skipped_silent} row(s) whose best {max_duration_sec}s window never reached "
+              f"min_window_rms={min_window_rms} — no window choice fixes true silence.")
+
+    windows_csv = output_jsonl.with_name(output_jsonl.stem + "_audio_windows.csv")
+    with windows_csv.open("w", newline="", encoding="utf-8") as wf:
+        writer = csv.writer(wf)
+        writer.writerow(["audio_filename", "start_sec", "rms", "motion_energy"])
+        writer.writerows(windows_log)
+    print(f"Per-row audio windows saved to {windows_csv}")
 
 # =========================
 # 3) Training prep & Debug
@@ -280,6 +446,12 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
                 p.data.mul_(1 - lr * wd)
             # Aspect-ratio-normalized step size, so the same lr is sane whether the
             # matrix is wide (LoRA A: r x in_features) or tall (LoRA B: out_features x r).
+            # KNOWN DEFECT (measured: rms(dW)=4e-3/step vs AdamW's 2e-4, 20x too big): this
+            # 0.2*sqrt(max_dim) factor already sizes the update to AdamW's RMS, so it must be
+            # paired with an AdamW-scale lr (~2e-4). The lr=0.02 default comes from the
+            # other Muon convention (no such factor) — combining both double-scales it. This
+            # is why Muon under-fit in run-overfit4-sep19 / run-overfit100-*. Fix: muon_lr
+            # ~2e-4 with this factor, or drop the factor and keep 0.02. Untested either way.
             scale = 0.2 * max(g.shape[-2:]) ** 0.5
             p.data.add_(g, alpha=-lr * scale)
 
@@ -345,6 +517,7 @@ def finetune(
     val_jsonl: str | Path | None = None,
     use_muon: bool = True,
     muon_lr: float = 0.02,
+    motion_num_codebooks: int = 2,
 ):
     # RESTORED: Checkpoint resuming logic
     resume_ckpt = None
@@ -378,7 +551,7 @@ def finetune(
         load_in_4bit=load_in_4bit,
     )
     
-    tokenizer = add_discrete_tokens(tokenizer)
+    tokenizer = add_discrete_tokens(tokenizer, motion_num_codebooks=motion_num_codebooks)
     model.resize_token_embeddings(len(tokenizer))
 
     model = FastLanguageModel.get_peft_model(
@@ -389,6 +562,17 @@ def finetune(
 
     from datasets import load_dataset
     dataset = load_dataset("json", data_files=str(train_jsonl), split="train")
+
+    # The vocabulary above only has <m_q_i> tokens for q < motion_num_codebooks, and the
+    # JSONL was tokenized with whatever level count the motion tokenizer was trained with —
+    # a mismatch here (e.g. 4-level JSONL, flag left at 2) trains on tokens the model has
+    # no embeddings for, which only shows up as garbage hours later. Fail now instead.
+    import re as _re
+    levels = {int(q) for q in _re.findall(r"<m_(\d+)_\d+>", dataset[0]["completion"])}
+    if levels != set(range(motion_num_codebooks)):
+        raise ValueError(f"{train_jsonl} uses motion levels {sorted(levels)} but "
+                         f"--num_quantizers={motion_num_codebooks}: they must match the "
+                         f"motion tokenizer's level count.")
 
     # RESTORED: Debug example printing
     for i in range(min(3, len(dataset))):
@@ -442,12 +626,12 @@ def finetune(
         per_device_train_batch_size=1,
         gradient_accumulation_steps=8,
         learning_rate=2e-4,
-        # 10 was fine for AdamW-only runs (peak lr 2e-4), but Muon's group peaks at 0.02 —
-        # 100x higher — and ramping there in 10 steps caused a real gradient explosion
-        # (grad_norm hit Infinity at step 119 in run-full-sep8, which NaN-poisoned every
-        # step after it once clipping divided by that Infinity). 200 steps gives the
-        # orthogonalized Muon update room to stabilize before hitting full LR.
-        warmup_steps=200,
+        # AdamW keeps the original 10: that is the exact setting that memorized the 4-clip
+        # set to loss ~5e-5 (run-aug29). The 200 applies to Muon only and was added when Muon
+        # blew up at step 119 in run-full-sep8 — it did not fix the real problem (Muon's
+        # update is ~20x larger than intended, see _step_muon) and, applied to
+        # AdamW too, it cost run-overfit4-sep19 its overfit: 40% of a 510-step run was warmup.
+        warmup_steps=200 if use_muon else 10,
         max_steps=max_steps,
         logging_steps=logging_steps, # Fixed
         save_steps=save_steps,
@@ -503,6 +687,16 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer_path", type=str, default="motion_tokenizer_artifacts/tokenizer.pt")
     parser.add_argument("--normalizer_path", type=str, default="motion_tokenizer_artifacts/normalizer.npz")
     parser.add_argument("--output_jsonl", type=str, default="datasets/speech_motion_train.jsonl")
+    parser.add_argument("--min_window_rms", type=float, default=0.0,
+                        help="Skip a row if even its best max_duration_sec window's RMS is below "
+                             "this — a truly silent clip still isn't memorizable no matter which "
+                             "window is picked (see select_best_audio_window). 0.0 = don't skip any.")
+    parser.add_argument("--select_windows", action="store_true",
+                        help="Only pick each row's audio window and write it to --output_windows_csv "
+                             "(see select_windows_to_csv); run before the motion tokenizer.")
+    parser.add_argument("--output_windows_csv", type=str, default=None)
+    parser.add_argument("--windows_csv", type=str, default=None,
+                        help="With --build_dataset: use these precomputed windows instead of re-selecting.")
     parser.add_argument("--output_dir", type=str, default="speech_motion_outputs")
     parser.add_argument("--base_model", type=str, default="unsloth/llama-3-8b-bnb-4bit")
     parser.add_argument("--max_steps", type=int, default=2000)
@@ -522,15 +716,21 @@ if __name__ == "__main__":
     parser.add_argument("--optimizer", choices=["muon", "adamw"], default="muon",
                         help="muon: LoRA's 2D weight matrices on Muon, embed_tokens/lm_head on "
                              "AdamW (see MuonWithAuxAdam). adamw: the previous all-AdamW behavior.")
+    parser.add_argument("--num_quantizers", type=int, default=2,
+                        help="Motion RVQ levels; must equal the value the motion tokenizer was trained with.")
     parser.add_argument("--muon_lr", type=float, default=0.02,
                         help="Muon's natural LR scale is much larger than Adam's (orthogonalized "
                              "updates, not raw-gradient scale) — not comparable to --learning_rate.")
 
     args = parser.parse_args()
 
+    if args.select_windows:
+        select_windows_to_csv(args.csv_path, args.output_windows_csv, min_window_rms=args.min_window_rms)
+
     if args.build_dataset:
         print("--- Step 1: Building Joint JSONL Dataset ---")
-        build_joint_jsonl(args.csv_path, args.tokenizer_path, args.normalizer_path, args.output_jsonl)
+        build_joint_jsonl(args.csv_path, args.tokenizer_path, args.normalizer_path, args.output_jsonl,
+                          min_window_rms=args.min_window_rms, windows_csv=args.windows_csv)
         print(f"Dataset successfully saved to {args.output_jsonl}\n")
 
     if args.train:
@@ -547,4 +747,5 @@ if __name__ == "__main__":
             val_jsonl=args.val_output_jsonl,
             use_muon=(args.optimizer == "muon"),
             muon_lr=args.muon_lr,
+            motion_num_codebooks=args.num_quantizers,
         )

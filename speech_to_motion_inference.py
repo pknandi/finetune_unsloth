@@ -15,33 +15,52 @@ from peft import PeftModel
 from encodec import EncodecModel
 from encodec.utils import convert_audio
 
-from vqvae_motion_tokenizer import VQVAETokenizer, Normalizer
+from vqvae_motion_tokenizer import VQVAETokenizer, Normalizer, features_to_smplx
 
-MOTION_NUM_CODEBOOKS = 2  # must match MotionVQVAE num_quantizers and training-side add_discrete_tokens
-
-def add_discrete_tokens(tokenizer):
+def add_discrete_tokens(tokenizer, num_quantizers: int):
+    # num_quantizers must match the motion tokenizer's RVQ level count AND the value the
+    # LoRA was trained with (training-side add_discrete_tokens) — else the embedding
+    # matrix shape and the token ids won't line up with the checkpoint.
     special = ["<|audio|>", "<|motion|>"]
     special += [f"<a_{q}_{i}>" for q in range(8) for i in range(1024)]
-    special += [f"<m_{q}_{i}>" for q in range(MOTION_NUM_CODEBOOKS) for i in range(1024)]
+    special += [f"<m_{q}_{i}>" for q in range(num_quantizers) for i in range(1024)]
     tokenizer.add_special_tokens({"additional_special_tokens": special})
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
 
-def tokenize_audio_encodec(audio_path: str, bandwidth: float = 6.0) -> np.ndarray:
+def tokenize_audio_encodec(audio_path: str, bandwidth: float = 6.0, start_sec: float = 0.0,
+                            max_duration_sec: float | None = 10.0) -> np.ndarray:
     model = EncodecModel.encodec_model_24khz()
     model.set_target_bandwidth(bandwidth)
     # RVQ codebook lookups are nearest-neighbor on continuous encoder output, so tiny
     # CPU-vs-GPU floating-point differences can flip a token index right at a decision
-    # boundary (measured ~0.7% of positions on a real clip — not a bug, just numeric
-    # non-determinism between devices). build_joint_jsonl encodes training audio on GPU
-    # when available; doing the same here keeps inference-time tokens on the same
-    # footing as what the model was actually trained on, instead of a silent train/
-    # inference device skew on top of whatever the model already has to generalize over.
+    # boundary. build_joint_jsonl encodes training audio on GPU when available; doing the
+    # same here keeps inference-time tokens on the same footing as what the model was
+    # actually trained on, instead of a silent train/inference device skew on top of
+    # whatever the model already has to generalize over.
     if torch.cuda.is_available():
         model = model.cuda()
 
     wav_np, sr = sf.read(str(audio_path), dtype="float32")
+    # Matches build_joint_jsonl's clip selection: if training conditioned this row's LLM
+    # prompt on its loudest window (see select_best_audio_window), inference has to start
+    # from that same offset, or the model is fed audio it was never trained to associate
+    # with this clip's motion. Look the value up from the training run's
+    # <jsonl-stem>_audio_windows.csv sidecar rather than guessing it.
+    start_sample = int(sr * start_sec) if start_sec > 0 else 0
+    # CROP THE RAW WAVEFORM before encoding, not just the resulting tokens after — this
+    # used to encode from start_sample to the end of the file and slice the CODES down to
+    # 750 (10s) afterward. EnCodec's encoder has a receptive field, so encoding a 10s clip
+    # in isolation produces measurably different tokens near the boundary than encoding it
+    # as the start of a much longer buffer (measured: 99.3% token match with the full ~49s
+    # remainder available as trailing context, rising to 99.7% with just 2s of extra
+    # context) — the ~0.7% mismatch previously blamed entirely on CPU/GPU float
+    # non-determinism was mostly this. Cropping first matches build_joint_jsonl exactly.
+    if max_duration_sec is not None:
+        wav_np = wav_np[start_sample: start_sample + int(sr * max_duration_sec)]
+    elif start_sample > 0:
+        wav_np = wav_np[start_sample:]
     wav = torch.from_numpy(wav_np).t()
     if wav.ndim == 1:
         wav = wav.unsqueeze(0)
@@ -61,9 +80,10 @@ def audio_tokens_to_text(codes: np.ndarray) -> str:
 
 def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, normalizer_path, output_npy_path, base_model,
                                 do_sample=True, temperature=1.0, top_p=0.9, repetition_penalty=1.2,
-                                no_repeat_ngram_size=0):
+                                no_repeat_ngram_size=0, num_quantizers=2, decode_translation=False,
+                                start_sec=0.0, max_duration_sec=10.0):
     print("1. Extracting and Aligning Audio Tokens...")
-    audio_codes = tokenize_audio_encodec(audio_path)
+    audio_codes = tokenize_audio_encodec(audio_path, start_sec=start_sec, max_duration_sec=max_duration_sec)
     
     audio_to_motion_ratio = 5  # VQVAE 2x compression: 75 audio-fps / 15 motion-fps
     max_a_frames = min(audio_codes.shape[1], 750)
@@ -78,7 +98,7 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
         max_seq_length=8192, 
         load_in_4bit=True
     )
-    tokenizer = add_discrete_tokens(tokenizer)
+    tokenizer = add_discrete_tokens(tokenizer, num_quantizers)
     model.resize_token_embeddings(len(tokenizer))
     model = PeftModel.from_pretrained(model, lora_model_dir)
     
@@ -161,7 +181,7 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
 
     completion_text = tokenizer.decode(outputs[0], skip_special_tokens=False).split("<|motion|>")[-1]
     # Multi-level RVQ tokens: <m_q_i> where q is the residual level. Each temporal
-    # block is a run of MOTION_NUM_CODEBOOKS tokens in level order (q=0,1,2,3).
+    # block is a run of num_quantizers tokens in level order (q=0,1,2,...).
     pairs = [(int(q), int(i)) for q, i in re.findall(r"<m_(\d+)_(\d+)>", completion_text)]
     if not pairs:
         print("Model failed to generate motion tokens.")
@@ -169,7 +189,7 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
 
     # Group into complete blocks, tolerating malformed output: keep only runs
     # where the levels appear in the exact expected order, drop anything partial.
-    Q = MOTION_NUM_CODEBOOKS
+    Q = num_quantizers
     blocks = []
     idx = 0
     while idx + Q <= len(pairs):
@@ -191,21 +211,32 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
     print("4. VQ-VAE Decoding...")
     motion_tok = VQVAETokenizer()
     motion_tok.load(tokenizer_path)
+    if motion_tok.num_quantizers != Q:
+        raise ValueError(f"{tokenizer_path} has {motion_tok.num_quantizers} RVQ levels but "
+                         f"--num_quantizers={Q}; they must match (and match training).")
     norm = Normalizer()
     norm.load(normalizer_path)
 
     motion_feat = motion_tok.decode(motion_ids)
     motion_feat = (motion_feat * norm.std) + norm.mean
 
-    # motion_feat layout matches preprocess_motion's output: [go_sin(3), go_cos(3),
-    # body(63), left_hand(45), right_hand(45), transl(3)] = 162 dims.
-    # Undo the sin/cos wrap-around-safe encoding to recover a plain axis-angle
-    # global_orient. Translation is stored as absolute world position (already
-    # un-normalized above) — no velocity integration, so no accumulating drift.
-    global_orient = np.arctan2(motion_feat[:, 0:3], motion_feat[:, 3:6])
-    body_and_hands = motion_feat[:, 6:159]
-    transl = motion_feat[:, 159:162]
+    # motion_feat layout matches preprocess_motion's output (162 dims); features_to_smplx
+    # undoes the global_orient encoding this tokenizer was trained with (6D, or sin/cos for
+    # older runs — recorded in normalizer.npz). Translation was trained clip-relative.
+    smplx_feat = features_to_smplx(motion_feat, norm.orient_repr, norm.pose_repr)
+    global_orient = smplx_feat[:, 0:3]
+    body_and_hands = smplx_feat[:, 3:156]
+    transl = smplx_feat[:, 156:159]
 
+    # By default the decoded translation is DISCARDED and the root held fixed. Measured (GT
+    # tokens -> decode, i.e. the best any LLM could do): the decoded root jitters by tens of
+    # cm to metres — a speaker who really moved 12 cm decoded to a 2.4 m wander / 10.5 m of
+    # path — because 3 of 162 channels normalized by a ~1 m dataset std leave real cm-scale
+    # motion far below the tokenizer's noise floor. That single channel was ~60-90% of the
+    # total MPJPE (pose alone: 64-76 mm on 4 clips, ~155-160 mm on 100 rows), and
+    # dropping it from the tokenizer doesn't change pose quality (64 vs 70 mm). Pass
+    # --decode_translation to get the old behavior.
+    #
     # Root translation is physically low-frequency (a body can't oscillate its
     # pelvis several cm per frame), but codebook quantization noise on the transl
     # channels un-normalizes into exactly that kind of frame-level wobble, which
@@ -216,7 +247,9 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
     # added lag; lag starts appearing beyond ~19, so this is deliberately not
     # wider despite further (diminishing) correlation gains out there.
     win = 15
-    if len(transl) >= win:
+    if not decode_translation:
+        transl = np.zeros_like(transl)
+    elif len(transl) >= win:
         kernel = np.ones(win) / win
         pad = win // 2
         padded = np.pad(transl, ((pad, pad), (0, 0)), mode="edge")
@@ -247,6 +280,17 @@ if __name__ == "__main__":
                              "keep this >= 1.0 unless you have a specific reason to go lower.")
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--repetition_penalty", type=float, default=1.2)
+    parser.add_argument("--num_quantizers", type=int, default=2,
+                        help="Motion RVQ levels; must equal the tokenizer's and the LoRA's training value.")
+    parser.add_argument("--start_sec", type=float, default=0.0,
+                        help="Skip this many seconds before the 10s window that gets tokenized — "
+                             "must match whatever this clip's row got in training (see the "
+                             "<jsonl-stem>_audio_windows.csv sidecar build_joint_jsonl writes), "
+                             "or the model is conditioned on audio unrelated to what it trained on.")
+    parser.add_argument("--decode_translation", action="store_true",
+                        help="Use the tokenizer's decoded root translation (smoothed) instead of "
+                             "holding the root fixed. Off by default: it is mostly noise (see the "
+                             "comment in generate_motion_from_audio).")
     parser.add_argument("--no_repeat_ngram_size", type=int, default=0,
                         help="Hard-blocks any repeated n-gram (0 = off). Stronger than "
                              "repetition_penalty but also blocks legitimately-static motion "
@@ -267,4 +311,7 @@ if __name__ == "__main__":
         top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
         no_repeat_ngram_size=args.no_repeat_ngram_size,
+        num_quantizers=args.num_quantizers,
+        decode_translation=args.decode_translation,
+        start_sec=args.start_sec,
     )

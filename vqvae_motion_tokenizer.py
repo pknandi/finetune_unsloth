@@ -4,7 +4,10 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import os
+import re
 import numpy as np
+from scipy.spatial.transform import Rotation
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -89,7 +92,42 @@ def load_smplx_sequence(motion_dirname: str | Path, include_betas: bool = False)
 
     return np.concatenate(blocks, axis=-1)
 
-def preprocess_motion(motion: np.ndarray) -> np.ndarray:
+def rotvec_to_6d(rotvec: np.ndarray) -> np.ndarray:
+    """(T, 3J) axis-angle for J joints -> (T, 6J): per joint, the first two columns of its
+    rotation matrix (Zhou et al., "On the Continuity of Rotation Representations"). Exact for
+    any rotation vector, including norms above pi, and continuous in the rotation."""
+    T = rotvec.shape[0]
+    m = Rotation.from_rotvec(rotvec.reshape(-1, 3)).as_matrix()
+    return np.concatenate([m[:, :, 0], m[:, :, 1]], axis=-1).reshape(T, -1).astype(np.float32)
+
+def sixd_to_rotvec(x: np.ndarray) -> np.ndarray:
+    """(T, 6J) -> (T, 3J) axis-angle. Gram-Schmidt, so a slightly-off network output still
+    decodes to a valid rotation."""
+    T = x.shape[0]
+    x = x.reshape(-1, 6)
+    a1, a2 = x[:, :3], x[:, 3:6]
+    b1 = a1 / (np.linalg.norm(a1, axis=-1, keepdims=True) + 1e-8)
+    b2 = a2 - (b1 * a2).sum(-1, keepdims=True) * b1
+    b2 = b2 / (np.linalg.norm(b2, axis=-1, keepdims=True) + 1e-8)
+    m = np.stack([b1, b2, np.cross(b1, b2)], axis=-1)
+    return Rotation.from_matrix(m).as_rotvec().reshape(T, -1).astype(np.float32)
+
+def feature_dim(pose_repr: str) -> int:
+    """Width of preprocess_motion's output: orient(6) + body + left/right hand + transl(3)."""
+    return 6 + 3 + (126 + 180 if pose_repr == "6d" else 63 + 90)
+
+def feature_channel_weights(pose_repr: str, hand_weight: float, transl_weight: float = 8.0) -> np.ndarray:
+    """Per-channel reconstruction-loss weights matching preprocess_motion's layout. Hands are
+    90 of the 162 axis-angle channels (180 of 315 in 6D) but the evaluation only scores 22
+    body joints, so at equal weight the codebook spends most of its capacity on fingers."""
+    n_body, n_hand = (126, 90) if pose_repr == "6d" else (63, 45)
+    w = np.ones(feature_dim(pose_repr), dtype=np.float32)
+    h0 = 6 + n_body
+    w[h0:h0 + 2 * n_hand] = hand_weight
+    w[-3:] = transl_weight
+    return w
+
+def preprocess_motion(motion: np.ndarray, orient_repr: str = "6d", pose_repr: str = "6d") -> np.ndarray:
     global_orient = motion[:, :3]
     body = motion[:, 3:66]
     left_hand = motion[:, 66:111]
@@ -123,22 +161,61 @@ def preprocess_motion(motion: np.ndarray) -> np.ndarray:
     # example's frame 0" are the same frame — this is not a per-window rebase.
     transl = motion[:, 156:159] - motion[0, 156:159]
 
-    # global_orient is a large-swing rotation that can exceed +/-pi in raw mocap
-    # data (real wrap-around observed in practice). A plain L1 loss on the raw
-    # radian value treats +pi and -pi — nearly the same rotation — as maximally
-    # far apart, which trains the VQ-VAE to reconstruct the wrong side of the
-    # wrap. sin/cos is continuous across that boundary, so nearby rotations stay
-    # numerically close no matter which side of +/-pi they land on.
-    global_orient_sincos = np.concatenate([np.sin(global_orient), np.cos(global_orient)], axis=-1)
+    # global_orient is a large-swing rotation whose axis-angle norm exceeds pi in raw mocap
+    # data (up to 9.8 rad here). "sin/cos of each axis-angle component" (orient_repr="sincos",
+    # the original encoding) is continuous, but it is NOT invertible to the same rotation:
+    # arctan2 wraps each component separately, which changes the rotation whenever the vector
+    # norm passes pi. Measured with no tokenizer in the loop (encode GT -> decode -> score):
+    # +25 mm root-relative MPJPE on the BWW760 target and +253 mm on GBM952 -- an error floor
+    # no codebook size can remove. 6D rotation (first two matrix columns) is exact and
+    # continuous, and takes the same 6 channels, so the feature width stays 162.
+    if orient_repr == "6d":
+        global_orient_feat = rotvec_to_6d(global_orient)
+    elif orient_repr == "sincos":
+        global_orient_feat = np.concatenate([np.sin(global_orient), np.cos(global_orient)], axis=-1)
+    else:
+        raise ValueError(f"unknown orient_repr {orient_repr!r}")
+
+    # Body and finger joints are axis-angle too, with the same non-canonical-norm problem
+    # (values up to 6.2 rad, 70 single-frame jumps > 3 rad across 26 ten-second windows) that
+    # L1 on raw components can't treat as "the same rotation". pose_repr="6d" encodes them
+    # like the root: 21 body + 30 hand joints x 6 = 306 channels instead of 153.
+    if pose_repr == "6d":
+        body, left_hand, right_hand = rotvec_to_6d(body), rotvec_to_6d(left_hand), rotvec_to_6d(right_hand)
+    elif pose_repr != "aa":
+        raise ValueError(f"unknown pose_repr {pose_repr!r}")
 
     return np.concatenate(
-        [global_orient_sincos, body, left_hand, right_hand, transl], axis=-1
+        [global_orient_feat, body, left_hand, right_hand, transl], axis=-1
     ).astype(np.float32)
 
+def features_to_smplx(feat: np.ndarray, orient_repr: str = "6d", pose_repr: str = "6d") -> np.ndarray:
+    """Inverse of preprocess_motion: de-normalized features -> (T, 159) SMPL-X
+    [global_orient(3) | body(63) | left_hand(45) | right_hand(45) | transl(3)], translation
+    still clip-relative as trained."""
+    if orient_repr == "6d":
+        global_orient = sixd_to_rotvec(feat[:, 0:6])
+    else:
+        global_orient = np.arctan2(feat[:, 0:3], feat[:, 3:6])
+    rest = feat[:, 6:]
+    if pose_repr == "6d":
+        body = sixd_to_rotvec(rest[:, 0:126])
+        left_hand = sixd_to_rotvec(rest[:, 126:216])
+        right_hand = sixd_to_rotvec(rest[:, 216:306])
+        transl = rest[:, 306:309]
+    else:
+        body, left_hand, right_hand, transl = rest[:, 0:63], rest[:, 63:108], rest[:, 108:153], rest[:, 153:156]
+    return np.concatenate([global_orient, body, left_hand, right_hand, transl], axis=-1).astype(np.float32)
+
 class Normalizer:
-    def __init__(self):
+    def __init__(self, orient_repr: str = "6d", pose_repr: str = "6d"):
         self.mean: Optional[np.ndarray] = None
         self.std: Optional[np.ndarray] = None
+        # Which rotation encodings these statistics (and the tokenizer trained with them) use.
+        # Saved with the file so inference decodes the way training encoded, and so tokenizers
+        # trained before 6D (sin/cos orient + raw axis-angle pose) keep decoding as trained.
+        self.orient_repr = orient_repr
+        self.pose_repr = pose_repr
 
     def fit(self, data: np.ndarray) -> None:
         self.mean = data.mean(axis=0, keepdims=True)
@@ -148,12 +225,15 @@ class Normalizer:
         return (data - self.mean) / self.std
 
     def save(self, path: str | Path) -> None:
-        np.savez(path, mean=self.mean, std=self.std)
+        np.savez(path, mean=self.mean, std=self.std, orient_repr=np.array(self.orient_repr),
+                 pose_repr=np.array(self.pose_repr))
 
     def load(self, path: str | Path) -> None:
         d = np.load(path)
         self.mean = d["mean"]
         self.std = d["std"]
+        self.orient_repr = str(d["orient_repr"]) if "orient_repr" in d.files else "sincos"
+        self.pose_repr = str(d["pose_repr"]) if "pose_repr" in d.files else "aa"
 
 # ==========================================
 # 2. VQ-VAE Architecture
@@ -262,12 +342,20 @@ class _WindowDataset(Dataset):
 # 3. Tokenizer Interface Wrapper
 # ==========================================
 class VQVAETokenizer:
-    def __init__(self, n_clusters: int = 1024, device: str = "cuda"):
+    def __init__(self, n_clusters: int = 1024, device: str = "cuda", num_quantizers: int = 2,
+                 input_dim: int = 162):
         self.device = device if torch.cuda.is_available() else "cpu"
-        self.model = MotionVQVAE(codebook_size=n_clusters).to(self.device)
+        self.n_clusters = n_clusters
+        self.model = MotionVQVAE(input_dim=input_dim, codebook_size=n_clusters,
+                                 num_quantizers=num_quantizers).to(self.device)
+
+    @property
+    def num_quantizers(self) -> int:
+        return len(self.model.quantizer.layers)
 
     def fit(self, chunks: List[np.ndarray], epochs: int = 500, batch_size: int = 16,
-            checkpoint_path: str | Path | None = None, resume: bool = True) -> None:
+            checkpoint_path: str | Path | None = None, resume: bool = True,
+            channel_weights: Optional[np.ndarray] = None) -> None:
         # TensorDataset(torch.tensor(np.array(chunks))) stacks the whole corpus into one
         # contiguous array THEN copies it again into a tensor — two full-corpus copies on
         # top of the chunks list itself. Fine at 4-clip scale; measured at full Embody-3D
@@ -304,8 +392,12 @@ class VQVAETokenizer:
         # away in favor of the dominant near-static frames. Upweight it so its
         # gradient contribution is comparable to the rest of the feature vector.
         input_dim = next(self.model.decoder[-1].parameters()).shape[0]
-        loss_weights = torch.ones(input_dim, device=self.device)
-        loss_weights[-3:] = 8.0
+        if channel_weights is not None:
+            loss_weights = torch.as_tensor(channel_weights, dtype=torch.float32, device=self.device)
+            assert loss_weights.shape == (input_dim,), (loss_weights.shape, input_dim)
+        else:
+            loss_weights = torch.ones(input_dim, device=self.device)
+            loss_weights[-3:] = 8.0
         loss_weights = loss_weights.view(1, -1, 1)
 
         self.model.train()
@@ -391,25 +483,55 @@ class VQVAETokenizer:
         torch.save(self.model.state_dict(), path)
 
     def load(self, path: str | Path) -> None:
-        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        state = torch.load(path, map_location=self.device)
+        # The level count lives in the weights (quantizer.layers.<i>.*), so callers never
+        # have to pass it (or get it wrong) just to load: rebuild the model to match.
+        n_levels = 1 + max(int(m.group(1)) for k in state
+                           for m in [re.match(r"quantizer\.layers\.(\d+)\.", k)] if m)
+        input_dim = state["encoder.0.weight"].shape[1]
+        codebook_size = state["quantizer.layers.0._codebook.embed"].shape[-2]
+        if (n_levels != self.num_quantizers or input_dim != self.model.encoder[0].in_channels
+                or codebook_size != self.n_clusters):
+            self.n_clusters = codebook_size
+            self.model = MotionVQVAE(input_dim=input_dim, codebook_size=codebook_size,
+                                     num_quantizers=n_levels).to(self.device)
+        self.model.load_state_dict(state)
 
 
 # ==========================================
 # 4. Dataset Processing & Training Loop
 # ==========================================
-def collect_dataset_from_csv(csv_path: str | Path) -> List[np.ndarray]:
+def load_audio_windows(windows_csv: str | Path) -> Dict[str, float]:
+    """audio_filename -> start_sec, from the sidecar written by speech_to_motion_pipeline's
+    window selection. Keys are normpath'd so './x' and 'x' match."""
+    df = pd.read_csv(windows_csv)
+    return {os.path.normpath(a): float(s) for a, s in zip(df["audio_filename"], df["start_sec"])}
+
+def collect_dataset_from_csv(csv_path: str | Path, orient_repr: str = "6d", pose_repr: str = "6d",
+                             windows: Optional[Dict[str, float]] = None,
+                             window_frames: int = 300) -> List[np.ndarray]:
+    """With `windows`, keeps only rows that have a window and only that window's frames --
+    exactly what the LLM's JSONL rows are built from (rows the window step skipped are absent)."""
     df = pd.read_csv(csv_path)
     all_data = []
     for i, row in tqdm(df.iterrows(), total=len(df), desc="Loading sequences"):
         try:
             motion = load_smplx_sequence(row["motion_dirname"])
-            all_data.append(preprocess_motion(motion))
+            if windows is not None:
+                key = os.path.normpath(row["audio_filename"])
+                if key not in windows:
+                    continue
+                off = round(windows[key] * 30)
+                motion = motion[off: off + window_frames]
+            all_data.append(preprocess_motion(motion, orient_repr, pose_repr))
         except Exception as e:
             print(f"Skipping row {i}: {e}")
     return all_data
 
 def fit_tokenizer_from_csv(csv_path: str | Path, save_dir: str | Path, n_clusters: int = 1024,
-                            epochs: int = 500, batch_size: int = 16, resume: bool = True) -> None:
+                            epochs: int = 500, batch_size: int = 16, resume: bool = True,
+                            num_quantizers: int = 2, windows_csv: str | Path | None = None,
+                            hand_weight: float = 0.3) -> None:
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     # Auto-resumes from here if present (matching speech_to_motion_pipeline.py's LoRA
@@ -425,7 +547,11 @@ def fit_tokenizer_from_csv(csv_path: str | Path, save_dir: str | Path, n_cluster
     # ~18GB just to build the training set. `sequences` itself is freed right after
     # windowing (see `del sequences` below) once it's no longer needed.
     print("Loading dataset...")
-    sequences = collect_dataset_from_csv(csv_path)
+    windows = load_audio_windows(windows_csv) if windows_csv else None
+    sequences = collect_dataset_from_csv(csv_path, windows=windows)
+    if windows is not None:
+        print(f"Tokenizer trains on the LLM's {len(sequences)} ten-second windows only "
+              f"({sum(len(s) for s in sequences) / 30:.0f}s of motion), not whole clips.")
 
     print("Fitting normalizer...")
     norm = Normalizer()
@@ -458,9 +584,11 @@ def fit_tokenizer_from_csv(csv_path: str | Path, save_dir: str | Path, n_cluster
     chunks = chunks + dynamic_chunks * 2
     print(f"Windows: {len(energies)} base + {len(dynamic_chunks)}x2 high-energy oversamples")
 
-    tokenizer = VQVAETokenizer(n_clusters=n_clusters)
+    tokenizer = VQVAETokenizer(n_clusters=n_clusters, num_quantizers=num_quantizers,
+                               input_dim=chunks[0].shape[1])
     tokenizer.fit(chunks, epochs=epochs, batch_size=batch_size,
-                  checkpoint_path=checkpoint_path, resume=resume)
+                  checkpoint_path=checkpoint_path, resume=resume,
+                  channel_weights=feature_channel_weights(norm.pose_repr, hand_weight))
 
     tokenizer.save(save_dir / "tokenizer.pt")
     norm.save(save_dir / "normalizer.npz")
@@ -479,7 +607,7 @@ def tokenize_csv_to_jsonl(csv_path: str | Path, save_dir: str | Path, output_jso
     with output_jsonl.open("w", encoding="utf-8") as f:
         for i, row in tqdm(df.iterrows(), total=len(df), desc="Tokenizing motion"):
             try:
-                motion = preprocess_motion(load_smplx_sequence(row["motion_dirname"]))
+                motion = preprocess_motion(load_smplx_sequence(row["motion_dirname"]), norm.orient_repr, norm.pose_repr)
                 motion = norm.transform(motion)
                 tokens = tokenizer.encode(motion)
                 
@@ -508,16 +636,34 @@ if __name__ == "__main__":
     # this and watch the printed epoch loss rather than assuming 500 is still right.
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--num_quantizers", type=int, default=2,
+                        help="RVQ levels per 2-frame block. Measured reconstruction ceiling (GT tokens "
+                             "-> decode, same seed): 4 levels beat 2 by ~35-40%% at both 4-clip and "
+                             "100-row scale; 2 was chosen because the LLM couldn't learn the fine "
+                             "levels on the full corpus (see MotionVQVAE). Must match the LLM stages.")
     parser.add_argument("--restart", action="store_true",
                         help="Ignore any existing <save_dir>/train_checkpoint.pt and start "
                              "training from epoch 0, instead of auto-resuming from it.")
+    parser.add_argument("--windows_csv", type=str, default=None,
+                        help="Per-row audio windows (speech_to_motion_pipeline.py --select_windows). "
+                             "Train ONLY on those 10 s windows -- the exact motion the LLM sees -- "
+                             "instead of whole clips. Whole-clip training measured 12x more motion "
+                             "than the LLM ever uses (3180 s vs 260 s on a 26-row set) and cost ~2.5x "
+                             "reconstruction error on those windows (114.7 -> 44.8 mm root-relative "
+                             "MPJPE at equal RVQ depth). Right for memorization runs; untested "
+                             "for a generalization run, where whole clips give broader coverage.")
+    parser.add_argument("--hand_weight", type=float, default=0.3,
+                        help="Reconstruction-loss weight on finger channels (body = 1). Hands are 55%% "
+                             "of the input channels but MPJPE scores 22 body joints; 0.3 cut mean "
+                             "root-relative MPJPE on the same windows by ~24%% in a tokenizer-only test.")
     parser.add_argument("--tokenize_jsonl", action="store_true")
     parser.add_argument("--output_jsonl", type=str, default="datasets/tokenized_data.jsonl")
     args = parser.parse_args()
 
     fit_tokenizer_from_csv(args.csv_path, args.save_dir, args.n_clusters,
                             epochs=args.epochs, batch_size=args.batch_size,
-                            resume=not args.restart)
+                            resume=not args.restart, num_quantizers=args.num_quantizers,
+                            windows_csv=args.windows_csv, hand_weight=args.hand_weight)
     
     if args.tokenize_jsonl:
         tokenize_csv_to_jsonl(args.csv_path, args.save_dir, args.output_jsonl)

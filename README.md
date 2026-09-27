@@ -46,7 +46,7 @@ needed by `visualize_motion.py`, `compare_motion.py`, and `evaluate_motion.py`.
 | `speech_to_motion_inference.py` | Runs inference: audio → predicted motion `.npy` |
 | `visualize_motion.py` | Renders a `.npy` motion sequence to video |
 | `compare_motion.py` | Side-by-side GT vs. predicted comparison video |
-| `evaluate_motion.py` | Quantitative metrics: MPJPE, PCK, velocity/accel/jerk, beat consistency |
+| `evaluate_motion.py` | Quantitative metrics: MPJPE, PCK, velocity/accel/jerk, beat consistency (prediction is rendered on the target subject's own body shape, so only pose is scored) |
 | `select_inference_sample.py` | Picks the most motion-dynamic held-out clip to use for inference/comparison |
 | `outputs/<run_name>/` | Everything a run produces — CSVs, tokenizer, LoRA checkpoints, inference outputs (gitignored) |
 | `k_means_motion_tokenizer.py`, `*_kmeans.py` | Older k-means tokenizer approach, superseded by the RVQ tokenizer above — kept for reference only |

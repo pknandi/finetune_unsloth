@@ -147,7 +147,21 @@ def load_gt_motion(session_dir: str | Path, subject: str, smplx_model_dir: str) 
     return joints.astype(np.float32), missing_mask
 
 
-def load_pred_motion(npy_path: str | Path, smplx_model_dir: str) -> np.ndarray:
+def load_gt_betas(session_dir: str | Path, subject: str) -> Optional[np.ndarray]:
+    """The subject's own body shape (1, N), or None if the dataset has no betas. The model
+    predicts pose only, so the prediction must be rendered on THIS shape: with SMPL-X's
+    default neutral body, even a perfect pose scores 8-50 mm MPJPE purely from bone-length
+    differences (measured by scoring the exact GT motion against itself)."""
+    folder = Path(session_dir) / subject / "smplx_mesh_betas"
+    files = sorted(folder.glob("*.npy")) if folder.exists() else []
+    if not files:
+        return None
+    b = np.load(files[0], allow_pickle=False)
+    return b.reshape(-1, b.shape[-1])[:1].astype(np.float32)
+
+
+def load_pred_motion(npy_path: str | Path, smplx_model_dir: str,
+                     betas: Optional[np.ndarray] = None) -> np.ndarray:
     """
     Load predicted motion from inference .npy  (T, 159).
     Layout must match pipeline output:
@@ -172,10 +186,12 @@ def load_pred_motion(npy_path: str | Path, smplx_model_dir: str) -> np.ndarray:
     right_hand    = arr[:, 111:156] if arr.shape[1] >= 156 else np.zeros((T, 45), dtype=np.float32)
     transl        = arr[:, -3:]     if arr.shape[1] >= 159 else np.zeros((T, 3), dtype=np.float32)
 
-    # No shape (betas) info in the predicted array — the model never predicts it,
-    # so this renders with SMPL-X's default neutral body shape.
+    # The model never predicts shape; `betas` (1, N) is the target subject's own, tiled over
+    # frames. None falls back to SMPL-X's neutral body.
+    if betas is not None:
+        betas = np.repeat(betas[:1], T, axis=0)
     joints = _real_smplx_fk(global_orient, body_pose, left_hand, right_hand,
-                             transl, None, smplx_model_dir)
+                             transl, betas, smplx_model_dir)
     return joints.astype(np.float32)
 
 
@@ -300,7 +316,7 @@ def diagnose(session_dir: str, subject: str, pred_npy: str, smplx_model_dir: str
     print(f"  Position range Z: [{gt_joints[:,:,2].min():.2f}, {gt_joints[:,:,2].max():.2f}]")
 
     print("\n── Prediction ───────────────────────────────────────────")
-    pred_joints = load_pred_motion(pred_npy, smplx_model_dir)
+    pred_joints = load_pred_motion(pred_npy, smplx_model_dir, betas=load_gt_betas(session_dir, subject))
     print(f"  Shape       : {pred_joints.shape}  →  {len(pred_joints)} frames  ({len(pred_joints)/30:.1f}s at 30fps)")
     print(f"  Position range X: [{pred_joints[:,:,0].min():.2f}, {pred_joints[:,:,0].max():.2f}]")
     print(f"  Position range Y: [{pred_joints[:,:,1].min():.2f}, {pred_joints[:,:,1].max():.2f}]")
@@ -327,18 +343,23 @@ def render_comparison(
     height:       int   = 540,
     elev:         float = 15.0,
     azim:         float = -60.0,
+    gt_start_sec: float = 0.0,
 ):
     # ── Load ──────────────────────────────────────────────────────────
     log.info("Loading ground truth  (session: %s, subject: %s) …", Path(session_dir).name, subject)
     gt_joints, missing_mask = load_gt_motion(session_dir, subject, smplx_model_dir)
 
     log.info("Loading prediction …")
-    pred_joints = load_pred_motion(pred_npy, smplx_model_dir)
+    pred_joints = load_pred_motion(pred_npy, smplx_model_dir, betas=load_gt_betas(session_dir, subject))
 
     # ── Clip to max_seconds ───────────────────────────────────────────
+    # gt_start_sec must match the training row's actual audio window (see
+    # build_joint_jsonl's <jsonl-stem>_audio_windows.csv) -- else this shows the right
+    # motion clip playing over the wrong 10s of ground truth and audio.
+    gt_start_frame = round(fps * gt_start_sec)
     max_frames   = int(fps * max_seconds)
-    gt_joints    = gt_joints[:max_frames]
-    missing_mask = missing_mask[:max_frames]
+    gt_joints    = gt_joints[gt_start_frame: gt_start_frame + max_frames]
+    missing_mask = missing_mask[gt_start_frame: gt_start_frame + max_frames]
     pred_joints  = pred_joints[:max_frames]
 
     # ── Align lengths ─────────────────────────────────────────────────
@@ -425,7 +446,7 @@ def render_comparison(
 
     if audio_path is not None and Path(audio_path).exists():
         wav, sr = sf.read(str(audio_path), dtype="float32", always_2d=True)
-        wav = wav[:int(sr * T / fps)]
+        wav = wav[int(sr * gt_start_sec): int(sr * gt_start_sec) + int(sr * T / fps)]
         tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         sf.write(tmp_wav.name, wav, sr)
 
@@ -480,6 +501,9 @@ if __name__ == "__main__":
     parser.add_argument("--height",       type=int,   default=540)
     parser.add_argument("--elev",         type=float, default=15.0)
     parser.add_argument("--azim",         type=float, default=-60.0)
+    parser.add_argument("--gt_start_sec", type=float, default=0.0,
+                        help="Score/render against ground-truth seconds starting here instead of 0 -- "
+                             "must match the training row's actual audio window.")
 
     args = parser.parse_args()
 
@@ -499,4 +523,5 @@ if __name__ == "__main__":
             height=args.height,
             elev=args.elev,
             azim=args.azim,
+            gt_start_sec=args.gt_start_sec,
         )

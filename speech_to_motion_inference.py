@@ -15,7 +15,8 @@ from peft import PeftModel
 from encodec import EncodecModel
 from encodec.utils import convert_audio
 
-from vqvae_motion_tokenizer import VQVAETokenizer, Normalizer, features_to_smplx
+from transformers import LogitsProcessor, LogitsProcessorList
+from vqvae_motion_tokenizer import VQVAETokenizer, Normalizer, features_to_smplx, smooth_features
 
 def add_discrete_tokens(tokenizer, num_quantizers: int):
     # num_quantizers must match the motion tokenizer's RVQ level count AND the value the
@@ -78,10 +79,51 @@ def audio_tokens_to_text(codes: np.ndarray) -> str:
     n_q, T = codes.shape
     return "".join(f"<a_{q}_{int(codes[q, t])}>" for t in range(T) for q in range(n_q)) 
 
+class CoarseLevelSampling(LogitsProcessor):
+    """Sampling only on the first `sample_levels` RVQ levels of each block; the finer levels
+    keep just their top token (greedy). The level is read from the last generated <m_q_i>.
+    Sampling every level let one random coarse pick derail the 7 refinements after it."""
+    def __init__(self, tokenizer, num_quantizers: int, sample_levels: int):
+        level = torch.full((len(tokenizer),), -1, dtype=torch.long)
+        for q in range(num_quantizers):
+            for i in range(1024):
+                level[tokenizer.convert_tokens_to_ids(f"<m_{q}_{i}>")] = q
+        self.level, self.Q, self.k = level, num_quantizers, sample_levels
+
+    def __call__(self, input_ids, scores):
+        last = self.level.to(input_ids.device)[input_ids[:, -1]]
+        nxt = torch.where(last < 0, torch.zeros_like(last), (last + 1) % self.Q)
+        greedy_rows = nxt >= self.k
+        if greedy_rows.any():
+            top = scores.argmax(-1, keepdim=True)
+            only_top = torch.full_like(scores, float("-inf")).scatter(1, top, scores.gather(1, top))
+            scores = torch.where(greedy_rows[:, None], only_top, scores)
+        return scores
+
+def load_lm(base_model, lora_model_dir, num_quantizers):
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=base_model,
+        max_seq_length=8192,
+        load_in_4bit=True
+    )
+    tokenizer = add_discrete_tokens(tokenizer, num_quantizers)
+    model.resize_token_embeddings(len(tokenizer))
+    model = PeftModel.from_pretrained(model, lora_model_dir)
+
+    if getattr(model.config, "tie_word_embeddings", False):
+        model.base_model.model.lm_head.weight = model.base_model.model.embed_tokens.weight
+
+    FastLanguageModel.for_inference(model)
+    return model, tokenizer
+
 def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, normalizer_path, output_npy_path, base_model,
                                 do_sample=True, temperature=1.0, top_p=0.9, repetition_penalty=1.2,
                                 no_repeat_ngram_size=0, num_quantizers=2, decode_translation=False,
-                                start_sec=0.0, max_duration_sec=10.0):
+                                start_sec=0.0, max_duration_sec=10.0, sample_levels=None, smooth_sigma=0.0,
+                                lm=None, ids_npy_path=None):
+    """lm: (model, tokenizer) from load_lm, to reuse one loaded model across calls.
+    sample_levels: with do_sample, sample only RVQ levels < sample_levels (None = all).
+    ids_npy_path: also save the (T, Q) motion-token ids there."""
     print("1. Extracting and Aligning Audio Tokens...")
     audio_codes = tokenize_audio_encodec(audio_path, start_sec=start_sec, max_duration_sec=max_duration_sec)
     
@@ -93,19 +135,7 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
     prompt = f"<|audio|>{audio_tokens_to_text(audio_codes)}<|motion|>"
 
     print("2. Loading Model Safely...")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=base_model, 
-        max_seq_length=8192, 
-        load_in_4bit=True
-    )
-    tokenizer = add_discrete_tokens(tokenizer, num_quantizers)
-    model.resize_token_embeddings(len(tokenizer))
-    model = PeftModel.from_pretrained(model, lora_model_dir)
-    
-    if getattr(model.config, "tie_word_embeddings", False):
-        model.base_model.model.lm_head.weight = model.base_model.model.embed_tokens.weight
-        
-    FastLanguageModel.for_inference(model)
+    model, tokenizer = lm if lm is not None else load_lm(base_model, lora_model_dir, num_quantizers)
     inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
     
     print(f"3. Generating Motion Tokens (do_sample={do_sample}, temperature={temperature}, "
@@ -174,6 +204,9 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
         # Only meaningful (and only accepted without warnings) under sampling.
         generate_kwargs["temperature"] = temperature
         generate_kwargs["top_p"] = top_p
+    if do_sample and sample_levels is not None and sample_levels < num_quantizers:
+        generate_kwargs["logits_processor"] = LogitsProcessorList(
+            [CoarseLevelSampling(tokenizer, num_quantizers, sample_levels)])
     if no_repeat_ngram_size and no_repeat_ngram_size > 0:
         generate_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
     with torch.no_grad():
@@ -203,6 +236,8 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
         print("Model generated motion tokens but no complete level-ordered blocks.")
         return
     motion_ids = np.array(blocks, dtype=np.int64)  # (T, Q)
+    if ids_npy_path:
+        np.save(ids_npy_path, motion_ids)
 
     # DEBUG PRINT: This will show you if the LLM is actually generating diverse motion!
     print(f"   -> Generated {len(pairs)} tokens -> {motion_ids.shape[0]} temporal blocks.")
@@ -219,6 +254,7 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
 
     motion_feat = motion_tok.decode(motion_ids)
     motion_feat = (motion_feat * norm.std) + norm.mean
+    motion_feat = smooth_features(motion_feat, smooth_sigma)
 
     # motion_feat layout matches preprocess_motion's output (162 dims); features_to_smplx
     # undoes the global_orient encoding this tokenizer was trained with (6D, or sin/cos for
@@ -272,9 +308,10 @@ if __name__ == "__main__":
     parser.add_argument("--output_npy_path", type=str, required=True)
     parser.add_argument("--base_model", type=str, default="unsloth/llama-3-8b-bnb-4bit")
     parser.add_argument("--greedy", action="store_true",
-                        help="Use greedy decoding instead of sampling — the old behavior, "
-                             "correct only for the tiny-overfit-set memorization check "
-                             "(same session in train and test), not for the full corpus.")
+                        help="Use greedy decoding instead of sampling. Use it when the audio is a "
+                             "training clip (overfit / memorization runs): run-overfit1000-q8-oct20 scored "
+                             "45.1 mm greedy (= its ceiling) vs 236.1 sampled on BWW760. Sampling stays "
+                             "the default for unseen audio.")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Below 1.0 SHARPENS the distribution (more repetitive, not less) — "
                              "keep this >= 1.0 unless you have a specific reason to go lower.")
@@ -291,6 +328,11 @@ if __name__ == "__main__":
                         help="Use the tokenizer's decoded root translation (smoothed) instead of "
                              "holding the root fixed. Off by default: it is mostly noise (see the "
                              "comment in generate_motion_from_audio).")
+    parser.add_argument("--sample_levels", type=int, default=None,
+                        help="With sampling, sample only the first N RVQ levels of each block and take "
+                             "the finer ones greedily (default: sample all).")
+    parser.add_argument("--smooth_sigma", type=float, default=0.0,
+                        help="Gaussian smoothing over time (frames) of the decoded features; 0 = off.")
     parser.add_argument("--no_repeat_ngram_size", type=int, default=0,
                         help="Hard-blocks any repeated n-gram (0 = off). Stronger than "
                              "repetition_penalty but also blocks legitimately-static motion "
@@ -314,4 +356,6 @@ if __name__ == "__main__":
         num_quantizers=args.num_quantizers,
         decode_translation=args.decode_translation,
         start_sec=args.start_sec,
+        sample_levels=args.sample_levels,
+        smooth_sigma=args.smooth_sigma,
     )

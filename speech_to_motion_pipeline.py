@@ -153,8 +153,15 @@ def motion_tokens_to_text(tokens: np.ndarray) -> str:
     T, Q = tokens.shape
     return "".join(f"<m_{q}_{int(tokens[t, q])}>" for t in range(T) for q in range(Q)) # NO SPACES
 
+def _select_row(job):
+    i, audio, motion, window_sec, min_rms = job
+    try:
+        return select_best_audio_window(audio, motion, window_sec=window_sec, min_rms=min_rms), None
+    except Exception as e:
+        return None, str(e)
+
 def select_windows_to_csv(csv_path: str | Path, output_csv: str | Path, window_sec: float = 10.0,
-                          min_window_rms: float = 0.0) -> None:
+                          min_window_rms: float = 0.0, workers: int = 16) -> None:
     """Runs select_best_audio_window on every row of csv_path and writes the kept rows'
     windows to output_csv (audio_filename,start_sec,rms,motion_energy). This is the ONE place a
     row's window is decided: the motion tokenizer trains on exactly these windows and
@@ -162,13 +169,19 @@ def select_windows_to_csv(csv_path: str | Path, output_csv: str | Path, window_s
     two can't drift apart. Rows whose best window is still below min_window_rms are left out."""
     df = pd.read_csv(csv_path)
     kept, skipped = [], 0
-    for i, row in tqdm(df.iterrows(), total=len(df), desc="Selecting windows"):
-        try:
-            start_sec, rms, energy = select_best_audio_window(
-                row["audio_filename"], row["motion_dirname"], window_sec=window_sec, min_rms=min_window_rms)
-        except Exception as e:
-            print(f"Skipping row {i}: {e}")
+    # ~2 s per row serially (~5.5 h at the full ~10k rows), so rows are scored in parallel
+    # (fork: the workers only use numpy/soundfile). Results come back in row order.
+    jobs = [(i, row["audio_filename"], row["motion_dirname"], window_sec, min_window_rms)
+            for i, row in df.iterrows()]
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing as mp
+    with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("fork")) as ex:
+        results = list(tqdm(ex.map(_select_row, jobs, chunksize=4), total=len(jobs), desc="Selecting windows"))
+    for (i, row), (res, err) in zip(df.iterrows(), results):
+        if err is not None:
+            print(f"Skipping row {i}: {err}")
             continue
+        start_sec, rms, energy = res
         if rms < min_window_rms:
             skipped += 1
             print(f"Skipping row {i}: best {window_sec}s window RMS={rms:.5f} < min_window_rms={min_window_rms}")
@@ -320,7 +333,7 @@ def add_discrete_tokens(tokenizer, audio_codebook_size=1024, audio_num_codebooks
 
 def encode_for_training(example, tokenizer, max_seq_length=8192):
     prompt_ids = tokenizer(example["prompt"], add_special_tokens=True, truncation=True, max_length=7000)["input_ids"]
-    completion_ids = tokenizer(example["completion"], add_special_tokens=False, truncation=True, max_length=1000)["input_ids"]
+    completion_ids = tokenizer(example["completion"], add_special_tokens=False, truncation=True, max_length=2000)["input_ids"]  # Q8 x 150 blocks = 1200; was 1000, which silently cut Q8 completions
 
     if len(completion_ids) > 0 and completion_ids[-1] != tokenizer.eos_token_id:
         completion_ids.append(tokenizer.eos_token_id)
@@ -337,7 +350,7 @@ def encode_for_training(example, tokenizer, max_seq_length=8192):
 
 def debug_example(example, tokenizer, max_seq_length=8192):
     prompt_ids = tokenizer(example["prompt"], add_special_tokens=True, truncation=True, max_length=7000)["input_ids"]
-    completion_ids = tokenizer(example["completion"], add_special_tokens=False, truncation=True, max_length=1000)["input_ids"]
+    completion_ids = tokenizer(example["completion"], add_special_tokens=False, truncation=True, max_length=2000)["input_ids"]  # Q8 x 150 blocks = 1200; was 1000, which silently cut Q8 completions
     
     if len(completion_ids) > 0 and completion_ids[-1] != tokenizer.eos_token_id:
         completion_ids.append(tokenizer.eos_token_id)
@@ -594,6 +607,10 @@ def finetune(
     val_dataset = None
     if val_jsonl is not None:
         val_dataset = load_dataset("json", data_files=str(val_jsonl), split="train")
+        # Eval runs every save_steps; the full-data held-out set (~500 rows of ~7k tokens) would add
+        # hours per run. A fixed random 200 keeps the loss curve comparable across evals.
+        if len(val_dataset) > 200:
+            val_dataset = val_dataset.shuffle(seed=0).select(range(200))
         val_dataset = val_dataset.map(lambda ex: encode_for_training(ex, tokenizer, max_seq_length), num_proc=2)
         print(f"Validation set: {len(val_dataset)} held-out examples from {val_jsonl}")
 

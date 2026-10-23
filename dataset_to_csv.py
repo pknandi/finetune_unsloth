@@ -147,6 +147,9 @@ def generate_dataset_csv(
         rng = random.Random(seed)
         rng.shuffle(sessions)
         n_test = max(1, round(len(sessions) * test_frac))
+        # The forced inference session must stay in training (it is the memorization check).
+        # Only changes the split when it would have been drawn into the test set.
+        sessions = [s for s in sessions if s != force_session]
         test_sessions = set(sessions[:n_test])
 
         train_rows = [r for r in dataset_rows if r["_session"] not in test_sessions]

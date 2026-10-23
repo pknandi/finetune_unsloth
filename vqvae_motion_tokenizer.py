@@ -207,6 +207,14 @@ def features_to_smplx(feat: np.ndarray, orient_repr: str = "6d", pose_repr: str 
         body, left_hand, right_hand, transl = rest[:, 0:63], rest[:, 63:108], rest[:, 108:153], rest[:, 153:156]
     return np.concatenate([global_orient, body, left_hand, right_hand, transl], axis=-1).astype(np.float32)
 
+def smooth_features(feat: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian smoothing over time (sigma in frames) of de-normalized features, before
+    features_to_smplx. Safe for 6D channels: sixd_to_rotvec re-orthonormalizes. sigma <= 0 is a no-op."""
+    if sigma <= 0:
+        return feat
+    from scipy.ndimage import gaussian_filter1d
+    return gaussian_filter1d(feat, sigma, axis=0, mode="nearest").astype(feat.dtype)
+
 class Normalizer:
     def __init__(self, orient_repr: str = "6d", pose_repr: str = "6d"):
         self.mean: Optional[np.ndarray] = None
@@ -343,10 +351,10 @@ class _WindowDataset(Dataset):
 # ==========================================
 class VQVAETokenizer:
     def __init__(self, n_clusters: int = 1024, device: str = "cuda", num_quantizers: int = 2,
-                 input_dim: int = 162):
+                 input_dim: int = 162, hidden_dim: int = 256):
         self.device = device if torch.cuda.is_available() else "cpu"
         self.n_clusters = n_clusters
-        self.model = MotionVQVAE(input_dim=input_dim, codebook_size=n_clusters,
+        self.model = MotionVQVAE(input_dim=input_dim, hidden_dim=hidden_dim, codebook_size=n_clusters,
                                  num_quantizers=num_quantizers).to(self.device)
 
     @property
@@ -355,7 +363,7 @@ class VQVAETokenizer:
 
     def fit(self, chunks: List[np.ndarray], epochs: int = 500, batch_size: int = 16,
             checkpoint_path: str | Path | None = None, resume: bool = True,
-            channel_weights: Optional[np.ndarray] = None) -> None:
+            channel_weights: Optional[np.ndarray] = None, acc_weight: float = 0.0) -> None:
         # TensorDataset(torch.tensor(np.array(chunks))) stacks the whole corpus into one
         # contiguous array THEN copies it again into a tensor — two full-corpus copies on
         # top of the chunks list itself. Fine at 4-clip scale; measured at full Embody-3D
@@ -436,6 +444,12 @@ class VQVAETokenizer:
                 vel_loss = (loss_weights * frame_weight[:, :, 1:] * vel_err.pow(2)).mean()
 
                 loss = rec_loss + vq_loss + vel_loss
+                # Acceleration term, same weighting. The decoded ceiling had 7x GT jerk at 1000 rows
+                # (run-overfit1000-q8-oct20) even with the velocity loss; 0 keeps the old objective.
+                if acc_weight > 0:
+                    acc_err = (reconstructed[:, :, 2:] - 2 * reconstructed[:, :, 1:-1] + reconstructed[:, :, :-2]) \
+                              - (x[:, :, 2:] - 2 * x[:, :, 1:-1] + x[:, :, :-2])
+                    loss = loss + acc_weight * (loss_weights * frame_weight[:, :, 2:] * acc_err.pow(2)).mean()
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
@@ -489,12 +503,16 @@ class VQVAETokenizer:
         n_levels = 1 + max(int(m.group(1)) for k in state
                            for m in [re.match(r"quantizer\.layers\.(\d+)\.", k)] if m)
         input_dim = state["encoder.0.weight"].shape[1]
+        hidden_dim = state["encoder.0.weight"].shape[0]
+        latent_dim = state["encoder.4.weight"].shape[0]
         codebook_size = state["quantizer.layers.0._codebook.embed"].shape[-2]
         if (n_levels != self.num_quantizers or input_dim != self.model.encoder[0].in_channels
+                or hidden_dim != self.model.encoder[0].out_channels
+                or latent_dim != self.model.encoder[4].out_channels
                 or codebook_size != self.n_clusters):
             self.n_clusters = codebook_size
-            self.model = MotionVQVAE(input_dim=input_dim, codebook_size=codebook_size,
-                                     num_quantizers=n_levels).to(self.device)
+            self.model = MotionVQVAE(input_dim=input_dim, hidden_dim=hidden_dim, latent_dim=latent_dim,
+                                     codebook_size=codebook_size, num_quantizers=n_levels).to(self.device)
         self.model.load_state_dict(state)
 
 
@@ -531,7 +549,7 @@ def collect_dataset_from_csv(csv_path: str | Path, orient_repr: str = "6d", pose
 def fit_tokenizer_from_csv(csv_path: str | Path, save_dir: str | Path, n_clusters: int = 1024,
                             epochs: int = 500, batch_size: int = 16, resume: bool = True,
                             num_quantizers: int = 2, windows_csv: str | Path | None = None,
-                            hand_weight: float = 0.3) -> None:
+                            hand_weight: float = 0.3, hidden_dim: int = 256, acc_weight: float = 0.0) -> None:
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     # Auto-resumes from here if present (matching speech_to_motion_pipeline.py's LoRA
@@ -584,11 +602,11 @@ def fit_tokenizer_from_csv(csv_path: str | Path, save_dir: str | Path, n_cluster
     chunks = chunks + dynamic_chunks * 2
     print(f"Windows: {len(energies)} base + {len(dynamic_chunks)}x2 high-energy oversamples")
 
-    tokenizer = VQVAETokenizer(n_clusters=n_clusters, num_quantizers=num_quantizers,
+    tokenizer = VQVAETokenizer(n_clusters=n_clusters, num_quantizers=num_quantizers, hidden_dim=hidden_dim,
                                input_dim=chunks[0].shape[1])
     tokenizer.fit(chunks, epochs=epochs, batch_size=batch_size,
                   checkpoint_path=checkpoint_path, resume=resume,
-                  channel_weights=feature_channel_weights(norm.pose_repr, hand_weight))
+                  channel_weights=feature_channel_weights(norm.pose_repr, hand_weight), acc_weight=acc_weight)
 
     tokenizer.save(save_dir / "tokenizer.pt")
     norm.save(save_dir / "normalizer.npz")
@@ -652,10 +670,16 @@ if __name__ == "__main__":
                              "reconstruction error on those windows (114.7 -> 44.8 mm root-relative "
                              "MPJPE at equal RVQ depth). Right for memorization runs; untested "
                              "for a generalization run, where whole clips give broader coverage.")
+    parser.add_argument("--hidden_dim", type=int, default=256,
+                        help="Encoder/decoder width. 512 cut tokenizer loss 0.81 -> 0.60 at 100 rows "
+                             "(256 plateaus as rows grow). Saved in the weights; load() infers it.")
     parser.add_argument("--hand_weight", type=float, default=0.3,
                         help="Reconstruction-loss weight on finger channels (body = 1). Hands are 55%% "
                              "of the input channels but MPJPE scores 22 body joints; 0.3 cut mean "
                              "root-relative MPJPE on the same windows by ~24%% in a tokenizer-only test.")
+    parser.add_argument("--acc_weight", type=float, default=0.0,
+                        help="Weight of an acceleration (second-difference) loss next to the velocity loss. "
+                             "0 = old objective. Added 2026-10-21 against decoded jitter (ceiling jerk 7x GT).")
     parser.add_argument("--tokenize_jsonl", action="store_true")
     parser.add_argument("--output_jsonl", type=str, default="datasets/tokenized_data.jsonl")
     args = parser.parse_args()
@@ -663,7 +687,8 @@ if __name__ == "__main__":
     fit_tokenizer_from_csv(args.csv_path, args.save_dir, args.n_clusters,
                             epochs=args.epochs, batch_size=args.batch_size,
                             resume=not args.restart, num_quantizers=args.num_quantizers,
-                            windows_csv=args.windows_csv, hand_weight=args.hand_weight)
+                            windows_csv=args.windows_csv, hand_weight=args.hand_weight,
+                            hidden_dim=args.hidden_dim, acc_weight=args.acc_weight)
     
     if args.tokenize_jsonl:
         tokenize_csv_to_jsonl(args.csv_path, args.save_dir, args.output_jsonl)

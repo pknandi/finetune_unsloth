@@ -3,7 +3,7 @@
 # Exit immediately if a command crashes
 set -e
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}   # overridable, e.g. by scripts/gpu_watcher.sh
 
 ENV_FILE="${ENV_FILE:-.env}"
 
@@ -25,7 +25,7 @@ echo "Running with STAGE=$STAGE STOP_STAGE=$STOP_STAGE"
 # ==========================================
 # RUN + LOGGING
 # ==========================================
-RUN_NAME="run-overfit100-tokfix-sep27"
+RUN_NAME="${RUN_NAME:-run-overfit1000-tokfix-oct17}"   # overridable, e.g. by scripts/orchestrate_1000.sh
 
 LOG_DIR="./outputs/terminal"
 LOG_FILE="$LOG_DIR/$(date '+%Y-%m-%d_%H-%M-%S').log"
@@ -80,7 +80,8 @@ USE_FULL_DATASET=true
 # eval stay in-distribution. Change this one line to try a different scenario or
 # combination; "" trains on every scene type with audio (the original full-mix behavior).
 # No effect when USE_FULL_DATASET=false (sample_dataset has no scene-type folders).
-SCENE_TYPES=""
+SCENE_TYPES="${SCENE_TYPES-}"   # env override, e.g. SCENE_TYPES="acting polyadic" or acting,polyadic
+SCENE_TYPES="${SCENE_TYPES//,/ }"
 
 # ==========================================
 # OVERFIT-SCALE SWEEP
@@ -90,7 +91,7 @@ SCENE_TYPES=""
 # a fixed row count via dataset_to_csv.py's --max_samples, to find the data scale where the
 # pipeline starts breaking down. Only takes effect when USE_FULL_DATASET=true.
 # "" = no cap (original full-dataset behavior, run-full-sep8's config).
-MAX_SAMPLES="100"
+MAX_SAMPLES="${MAX_SAMPLES-1000}"   # env override; MAX_SAMPLES="" = no cap
 
 # A capped subset drawn from every scene type would be a random grab-bag spanning ~7 very
 # different scenarios — that confounds "does scale break it" with "does diversity break
@@ -115,7 +116,7 @@ MAX_SAMPLES_FLAG=""
 # reconstruction ceiling (GT tokens -> decode, same seed): 4 levels beat 2 by ~35-40% at
 # both 4-clip and 100-row scale, but the LLM couldn't learn the fine levels on the full
 # corpus, so 4 is for the memorization/overfit checks unless that changes.
-NUM_QUANTIZERS=4    # Tokenizer-only ceiling, same 26 windows, all other settings equal (root-relative
+NUM_QUANTIZERS=${NUM_QUANTIZERS:-4}    # Tokenizer-only ceiling, same 26 windows, all other settings equal (root-relative
                     # MPJPE mean/BWW760, mm): Q2 42.0/76.6, Q3 29.9/43.2, Q4 25.0/41.8. Each residual
                     # level adds a tier of detail; more codes per level does not (see N_CLUSTERS).
 
@@ -134,6 +135,17 @@ MIN_WINDOW_RMS=0.0
 # setting for a memorization run; for a generalization run whole clips give broader coverage
 # (untested), so it stays false outside the "25)" case.
 TOK_ON_WINDOWS=false
+
+# Motion tokenizer encoder/decoder width. 256 = original. At 100 rows, 512 cut the tokenizer's
+# training loss 0.81 -> 0.60 (codebook 2048 instead of 1024 did nothing: 0.83); see
+# docs/EXPERIMENT_LOG.md. Saved in the weights, so every later stage picks it up automatically.
+TOK_HIDDEN_DIM=256
+
+# Post-decode Gaussian smoothing over time (frames), stage 6. Q8 tokenizer, 31 clips: sigma 0 ->
+# jerk 9.1x GT, mean ceiling 42.1 mm; 1.5 -> jerk 0.99x, 41.0 mm; 3 -> 0.30x (smoother than real motion).
+SMOOTH_SIGMA=${SMOOTH_SIGMA:-1.5}
+# Tokenizer acceleration-loss weight (stage 2); 0 = the objective every earlier run used.
+TOK_ACC_WEIGHT=${TOK_ACC_WEIGHT:-0}
 
 # Everything that differs between the two modes lives in this one branch — split across
 # separate variables further down used to mean flipping USE_FULL_DATASET but forgetting
@@ -167,7 +179,11 @@ if [ "$USE_FULL_DATASET" = true ]; then
     MAX_STEPS=10000
     SAVE_STEPS=500
     FINAL_CHECKPOINT_STEP=10000   # exact multiple of SAVE_STEPS below, so this checkpoint is guaranteed to exist
-    DECODE_FLAGS=""   # sampling defaults (do_sample=True) — appropriate once training data is diverse
+    # Decoding rule (2026-10-21): sampling when stage 6 scores held-out audio (full run, below);
+    # greedy when it scores a training clip (overfit runs, set right below). On run-overfit1000-q8-oct20
+    # (BWW760, a training clip) sampling scored 236.1 mm and dropped frames; greedy scored 45.1 = ceiling.
+    DECODE_FLAGS=""
+    [ -n "$MAX_SAMPLES" ] && DECODE_FLAGS="--greedy"   # overfit runs score BWW760, which is in training
 
     # MAX_SAMPLES overrides the block above with configs sized for a much smaller,
     # scenario-coherent subset (see OVERFIT-SCALE SWEEP above). TEST_FRAC stays high enough
@@ -197,7 +213,6 @@ if [ "$USE_FULL_DATASET" = true ]; then
             MAX_STEPS=3200          # 1020 passes/row (overfit4's exposure): 1020*25/8 = 3187.5
             SAVE_STEPS=400
             FINAL_CHECKPOINT_STEP=3200
-            DECODE_FLAGS=""
             # 0.0002: a clip whose loudest 10 s window is still under this is true silence
             # throughout; reclipping cannot help (collapsed pairs sharing >50% identical audio
             # tokens 143->24, >90% 20->1, on the other 26 rows).
@@ -226,13 +241,65 @@ if [ "$USE_FULL_DATASET" = true ]; then
             FINAL_CHECKPOINT_STEP=800  # LLM capacity was never the bottleneck here, only the tokenizer was.
             ;;
         1000)
-            MIN_WINDOW_RMS=0.0
-            TEST_FRAC=0.1
-            TOK_EPOCHS=60
-            TOK_BATCH_SIZE=64
-            MAX_STEPS=2500      # eff. batch 8 -> ~20 passes over 1000 rows, matching
-            SAVE_STEPS=250      # acting-sep2's exposure level at a similar row count
+            # Same tokenizer fixes as 25/100 (see docs/EXPERIMENT_LOG.md). At 100 rows the LLM hit
+            # 100% teacher-forced accuracy and matched its tokenizer ceiling exactly, so the
+            # tokenizer is the only bottleneck; read this run's stage-2 ceiling before judging it.
+            TEST_FRAC=0.1           # held-out sessions -> val loss + a generalization number
+            TOK_EPOCHS=1600         # 400 (~51k steps) left the ceiling at 116.8 mm on BWW760 with loss still
+            TOK_BATCH_SIZE=64       # falling (1.35 -> 1.21 over ep 100-400); resumes from train_checkpoint.pt
+            TOK_ON_WINDOWS=true
+            TOK_HIDDEN_DIM=${TOK_HIDDEN_DIM_1000:-1024}     # 100-row ceiling, mean over 81 rows: 256 -> 52.7 mm, 512 -> 37.1, 1024 -> 29.7
+            MIN_WINDOW_RMS=0.0002
+            MAX_STEPS=2500          # ~23 passes/row; run-acting-sep2 memorized 1219 rows at ~20
+            SAVE_STEPS=250          # passes (loss 0.006). ~21 s/step on a shared L40S -> ~14.5 h.
             FINAL_CHECKPOINT_STEP=2500
+            ;;
+        "")
+            # Full dataset (2026-10-21): every clip with audio, i.e. the 7 categories that have it
+            # (emotions 2236, location 2097, polyadic 2015, acting 1355, daylife 1286, aiagent 1124,
+            # icebreakers 94 = 10207 rows). Settings that won at 1000 rows: Q8, hidden 1024, windows-only
+            # tokenizer, smoothing 1.5. Overrides the older full-data block above.
+            TEST_FRAC=0.05          # ~500 held-out rows; the trainer evaluates a fixed 200 of them
+            TOK_EPOCHS=200          # ~10x the windows of 1000 rows, so ~1.3k steps/epoch: 200 ep ~ the
+            TOK_BATCH_SIZE=64       # 205k steps that took 1000 rows to ceiling 42.1 mm. Resumable.
+            TOK_ON_WINDOWS=true
+            TOK_HIDDEN_DIM=1024
+            NUM_QUANTIZERS=8
+            MIN_WINDOW_RMS=0.0002
+            MAX_STEPS=4000          # ~3.4 passes over ~9.7k rows. The goal is held-out quality, not
+            SAVE_STEPS=250          # memorization (held-out loss was best at ~4.5 passes on 1000 rows);
+            FINAL_CHECKPOINT_STEP=4000  # the best eval-loss checkpoint is kept.
+            ;;
+        3400)
+            # Scale step 2026-10-21: acting + polyadic, run with SCENE_TYPES="acting polyadic"
+            # (1355 + 2015 = 3370 rows with audio, so the cap is a no-op; MAX_SAMPLES keeps BWW760's
+            # session forced into training for the greedy stage-6 check). 3.4x the 1000-row run, one
+            # new scene. Same winning settings: Q8, hidden 1024, windows-only tokenizer, smoothing 1.5.
+            TEST_FRAC=0.1           # ~340 held-out rows; the trainer evaluates a fixed 200 of them
+            TOK_EPOCHS=450          # ~3.7x the windows of 1000 rows: 450 ep ~ the 205k steps that took
+            TOK_BATCH_SIZE=64       # 1000 rows to ceiling 42.1 mm. Resumable if the ceiling says more.
+            TOK_ON_WINDOWS=true
+            TOK_HIDDEN_DIM=1024
+            NUM_QUANTIZERS=8
+            MIN_WINDOW_RMS=0.0002
+            MAX_STEPS=2500          # ~6.6 passes over ~3k rows; the best held-out-loss checkpoint is
+            SAVE_STEPS=250          # kept (it was ~4.5 passes at 1000 rows, may move later with more data)
+            FINAL_CHECKPOINT_STEP=2500
+            ;;
+        1355)
+            # All of acting (1355 rows with audio, so the cap is a no-op; MAX_SAMPLES only keeps
+            # BWW760's session forced into training). Settings that won at 1000 rows: Q8, hidden 1024,
+            # 1600 tok epochs (ceiling 45.5 / 42.1 mm), greedy on BWW760, smoothing sigma 1.5.
+            TEST_FRAC=0.1
+            TOK_EPOCHS=1600
+            TOK_BATCH_SIZE=64
+            TOK_ON_WINDOWS=true
+            TOK_HIDDEN_DIM=1024
+            NUM_QUANTIZERS=8
+            MIN_WINDOW_RMS=0.0002
+            MAX_STEPS=2000          # ~13 passes over ~1220 train rows; held-out loss is checked every 250
+            SAVE_STEPS=250          # steps and the best checkpoint is kept (it was ~4.5 passes at 1000 rows)
+            FINAL_CHECKPOINT_STEP=2000
             ;;
     esac
 else
@@ -333,14 +400,20 @@ fi
 if [ "$STAGE" -le 2 ] && [ "$STOP_STAGE" -ge 2 ]; then
     echo -e "\n${YELLOW}=> [2/9] Training Motion Tokenizer...${NC}"
 
-    if [ "$TOK_ON_WINDOWS" = true ]; then
+    if [ "$TOK_ON_WINDOWS" = true ] && [ -f "$WINDOWS_CSV" ]; then
+        # Deterministic for a given CSV + MIN_WINDOW_RMS; reusing it saves ~30 min on a 1000-row
+        # restart. Delete it (or use a new RUN_NAME) if either of those changed.
+        echo "Reusing existing $WINDOWS_CSV"
+    elif [ "$TOK_ON_WINDOWS" = true ]; then
         python3 speech_to_motion_pipeline.py --select_windows \
             --csv_path $TOK_CSV \
             --output_windows_csv $WINDOWS_CSV \
             --min_window_rms $MIN_WINDOW_RMS
     fi
 
-    python3 vqvae_motion_tokenizer.py \
+    # OMP/MKL cap: unset, torch's CPU pool spun ~38 cores (GPU at 3 %) on this shared box. With 8
+    # threads the 1000-row tokenizer ran 15-18 it/s instead of ~0.7-2 it/s (2026-10-20).
+    OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 python3 vqvae_motion_tokenizer.py \
         --csv_path $TOK_CSV \
         --save_dir $TOK_SAVE_DIR \
         --n_clusters $N_CLUSTERS \
@@ -348,6 +421,8 @@ if [ "$STAGE" -le 2 ] && [ "$STOP_STAGE" -ge 2 ]; then
         --batch_size $TOK_BATCH_SIZE \
         --num_quantizers $NUM_QUANTIZERS \
         $TOK_WINDOWS_FLAG \
+        --hidden_dim $TOK_HIDDEN_DIM \
+        --acc_weight $TOK_ACC_WEIGHT \
         --tokenize_jsonl
 fi
 
@@ -523,6 +598,7 @@ if [ "$STAGE" -le 6 ] && [ "$STOP_STAGE" -ge 6 ]; then
         --output_npy_path $INFERENCE_OUTPUT \
         --num_quantizers $NUM_QUANTIZERS \
         --start_sec $AUDIO_START_SEC \
+        --smooth_sigma $SMOOTH_SIGMA \
         $DECODE_FLAGS
 
     echo -e "${GREEN}Motion output saved to: $INFERENCE_OUTPUT${NC}"

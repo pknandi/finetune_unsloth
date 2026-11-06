@@ -236,3 +236,7 @@ Motion_speech_project**
 tmux_log*
 outputs
 full_dataset
+
+# paper synced with Overleaf (scripts/overleaf_sync.py); kept out of the code repo
+paper/
+.paper_backup/

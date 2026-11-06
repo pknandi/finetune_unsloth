@@ -1,0 +1,12 @@
+Base, old symmetric decoder (467 ms output look-ahead) & 0.398 & 3.43 & 0.43 \\
+Base, causal decoder & 0.359 & 2.72 & 2.28 \\
++ forward-KL on-policy distillation (d4) & 0.426 & 2.95 & 2.14 \\
++ deployment-matched rollouts (Ca) & 0.483 & 3.12 & 2.19 \\
++ guided teacher target (Cb) & 0.515 & 3.57 & 2.24 \\
++ level-aware weights (Db) & 0.544 & 3.56 & 2.37 \\
+Db, seed 1 & 0.541 & 3.49 & 2.43 \\
+Db, one forward pass (guidance 1) & 0.402 & 3.42 & 2.10 \\
+Cb + speech-salient weights (Da, dropped) & 0.494 & 3.65 & 2.52 \\
+Db + anticipatory encoder loss (E1, dropped) & 0.533 & 3.66 & 2.22 \\
+Db, 2-token decoder (133 ms) & 0.552 & 3.73 & 1.98 \\
+Offline teacher F2 (old decoder, hears the future) & 0.569 & 3.49 & 0.39 \\

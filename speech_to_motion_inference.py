@@ -116,6 +116,59 @@ def load_lm(base_model, lora_model_dir, num_quantizers):
     FastLanguageModel.for_inference(model)
     return model, tokenizer
 
+def motion_ids_to_smplx(motion_ids, tokenizer_path, normalizer_path, smooth_sigma=0.0, decode_translation=False):
+    """(T, Q) motion-token ids -> (2T, 159) SMPL-X array (global_orient, body+hands, transl)."""
+    motion_tok = VQVAETokenizer()
+    motion_tok.load(tokenizer_path)
+    if motion_tok.num_quantizers != motion_ids.shape[1]:
+        raise ValueError(f"{tokenizer_path} has {motion_tok.num_quantizers} RVQ levels but the ids have "
+                         f"{motion_ids.shape[1]}; they must match (and match training).")
+    norm = Normalizer()
+    norm.load(normalizer_path)
+
+    motion_feat = motion_tok.decode(motion_ids)
+    motion_feat = (motion_feat * norm.std) + norm.mean
+    motion_feat = smooth_features(motion_feat, smooth_sigma)
+
+    # motion_feat layout matches preprocess_motion's output (162 dims); features_to_smplx
+    # undoes the global_orient encoding this tokenizer was trained with (6D, or sin/cos for
+    # older runs — recorded in normalizer.npz). Translation was trained clip-relative.
+    smplx_feat = features_to_smplx(motion_feat, norm.orient_repr, norm.pose_repr)
+    global_orient = smplx_feat[:, 0:3]
+    body_and_hands = smplx_feat[:, 3:156]
+    transl = smplx_feat[:, 156:159]
+
+    # By default the decoded translation is DISCARDED and the root held fixed. Measured (GT
+    # tokens -> decode, i.e. the best any LLM could do): the decoded root jitters by tens of
+    # cm to metres — a speaker who really moved 12 cm decoded to a 2.4 m wander / 10.5 m of
+    # path — because 3 of 162 channels normalized by a ~1 m dataset std leave real cm-scale
+    # motion far below the tokenizer's noise floor. That single channel was ~60-90% of the
+    # total MPJPE (pose alone: 64-76 mm on 4 clips, ~155-160 mm on 100 rows), and
+    # dropping it from the tokenizer doesn't change pose quality (64 vs 70 mm). Pass
+    # --decode_translation to get the old behavior.
+    #
+    # Root translation is physically low-frequency (a body can't oscillate its
+    # pelvis several cm per frame), but codebook quantization noise on the transl
+    # channels un-normalizes into exactly that kind of frame-level wobble, which
+    # renders as the character floating/gliding. A centered moving average
+    # (~0.5s at 30fps output) removes the wobble while preserving real walking
+    # trajectories, which live at much lower frequencies. Measured on real data:
+    # widening from 11->15 improves jitter and GT-velocity correlation with no
+    # added lag; lag starts appearing beyond ~19, so this is deliberately not
+    # wider despite further (diminishing) correlation gains out there.
+    win = 15
+    if not decode_translation:
+        transl = np.zeros_like(transl)
+    elif len(transl) >= win:
+        kernel = np.ones(win) / win
+        pad = win // 2
+        padded = np.pad(transl, ((pad, pad), (0, 0)), mode="edge")
+        transl = np.stack(
+            [np.convolve(padded[:, c], kernel, mode="valid") for c in range(3)], axis=-1
+        )
+
+    return np.concatenate([global_orient, body_and_hands, transl], axis=-1)
+
 def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, normalizer_path, output_npy_path, base_model,
                                 do_sample=True, temperature=1.0, top_p=0.9, repetition_penalty=1.2,
                                 no_repeat_ngram_size=0, num_quantizers=2, decode_translation=False,
@@ -244,56 +297,8 @@ def generate_motion_from_audio(audio_path, lora_model_dir, tokenizer_path, norma
     print(f"   -> First 3 blocks: {motion_ids[:3].tolist()}")
 
     print("4. VQ-VAE Decoding...")
-    motion_tok = VQVAETokenizer()
-    motion_tok.load(tokenizer_path)
-    if motion_tok.num_quantizers != Q:
-        raise ValueError(f"{tokenizer_path} has {motion_tok.num_quantizers} RVQ levels but "
-                         f"--num_quantizers={Q}; they must match (and match training).")
-    norm = Normalizer()
-    norm.load(normalizer_path)
-
-    motion_feat = motion_tok.decode(motion_ids)
-    motion_feat = (motion_feat * norm.std) + norm.mean
-    motion_feat = smooth_features(motion_feat, smooth_sigma)
-
-    # motion_feat layout matches preprocess_motion's output (162 dims); features_to_smplx
-    # undoes the global_orient encoding this tokenizer was trained with (6D, or sin/cos for
-    # older runs — recorded in normalizer.npz). Translation was trained clip-relative.
-    smplx_feat = features_to_smplx(motion_feat, norm.orient_repr, norm.pose_repr)
-    global_orient = smplx_feat[:, 0:3]
-    body_and_hands = smplx_feat[:, 3:156]
-    transl = smplx_feat[:, 156:159]
-
-    # By default the decoded translation is DISCARDED and the root held fixed. Measured (GT
-    # tokens -> decode, i.e. the best any LLM could do): the decoded root jitters by tens of
-    # cm to metres — a speaker who really moved 12 cm decoded to a 2.4 m wander / 10.5 m of
-    # path — because 3 of 162 channels normalized by a ~1 m dataset std leave real cm-scale
-    # motion far below the tokenizer's noise floor. That single channel was ~60-90% of the
-    # total MPJPE (pose alone: 64-76 mm on 4 clips, ~155-160 mm on 100 rows), and
-    # dropping it from the tokenizer doesn't change pose quality (64 vs 70 mm). Pass
-    # --decode_translation to get the old behavior.
-    #
-    # Root translation is physically low-frequency (a body can't oscillate its
-    # pelvis several cm per frame), but codebook quantization noise on the transl
-    # channels un-normalizes into exactly that kind of frame-level wobble, which
-    # renders as the character floating/gliding. A centered moving average
-    # (~0.5s at 30fps output) removes the wobble while preserving real walking
-    # trajectories, which live at much lower frequencies. Measured on real data:
-    # widening from 11->15 improves jitter and GT-velocity correlation with no
-    # added lag; lag starts appearing beyond ~19, so this is deliberately not
-    # wider despite further (diminishing) correlation gains out there.
-    win = 15
-    if not decode_translation:
-        transl = np.zeros_like(transl)
-    elif len(transl) >= win:
-        kernel = np.ones(win) / win
-        pad = win // 2
-        padded = np.pad(transl, ((pad, pad), (0, 0)), mode="edge")
-        transl = np.stack(
-            [np.convolve(padded[:, c], kernel, mode="valid") for c in range(3)], axis=-1
-        )
-
-    final_smplx_array = np.concatenate([global_orient, body_and_hands, transl], axis=-1)
+    final_smplx_array = motion_ids_to_smplx(motion_ids, tokenizer_path, normalizer_path, smooth_sigma,
+                                            decode_translation)
 
     np.save(output_npy_path, final_smplx_array)
     print(f"Saved motion to: {output_npy_path}")

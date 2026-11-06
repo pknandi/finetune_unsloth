@@ -1,0 +1,14 @@
+Online base (old decoder) & 0.663 & 0.767 \\
++ forward-KL distillation, seed 0 (old decoder, 2-sided smoothing) & 0.615 & 0.779 \\
++ forward-KL distillation, seed 1 & 0.595 & 0.777 \\
++ forward-KL distillation, seed 2 & 0.599 & 0.777 \\
+seed 0, old decoder, 1-sided smoothing & 0.585 & 0.783 \\
+seed 0, old decoder, no smoothing & 0.555 & 0.786 \\
+seed 0, causal decoder 0 ms & 0.781 & 0.783 \\
+seed 0, causal decoder 67 ms & 0.701 & 0.785 \\
+seed 0, causal decoder 133 ms & 0.545 & 0.787 \\
+seed 1, causal decoder 133 ms & 0.574 & 0.786 \\
+seed 2, causal decoder 133 ms & 0.550 & 0.786 \\
+C/D (Db recipe), old decoder & 0.611 & 0.783 \\
+C/D (Db recipe), causal 133 ms & 0.614 & 0.789 \\
+Undistilled online, causal 133 ms & 0.600 & 0.780 \\

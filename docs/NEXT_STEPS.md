@@ -70,3 +70,59 @@ Scale phase:
 - Added `scripts/audio_shuffle.py`. On held-out rows it compares the token NLL of the true motion with the right audio vs another row's audio. gap = wrong - right; gap > 0 means the model uses the audio. It is gated by the orchestrator: branch A runs it on the 1000-row ckpt 500 / 2500 when a GPU has 24 GB free, and branch S runs it on the actpoly best ckpt after training.
 - Branch B: Q8 + hidden 2048 tokenizer on the acting + polyadic windows (`outputs/fix-oct21/tok_h2048_actpoly`), 450 epochs, started 04:16 on GPU 0, ~45 s/epoch (~5.6 h). Then ceiling at sigma 0 / 1.5 / 2 vs hidden 1024's 58.8 / 57.8.
 - If B wins clearly, retrain the actpoly LLM on it (or use it for the full run).
+
+## 2026-10-23: the LLM ignored the audio; switched to time-aligned HuBERT
+- acting + polyadic EnCodec LLM: shuffle gap +0.007 (= 1000 rows). Scaling the old format won't help.
+- Probe (`scripts/signal_probe.py`): only continuous HuBERT carries the timing signal (+0.054 vs EnCodec +0.009). Units lose most of it.
+- New model `speech_to_motion_aligned.py`, training in `motion:al_train` via `scripts/orchestrate_aligned.sh` (~11 h from 14:17 UTC).
+- Success = `EVAL ... gap_shift` clearly > 0 (probe: +0.054) and BWW760 / held-out MPJPE below the old model's (229 / 263-291).
+- Then: full 10k data (`run-full-q8-oct21` windows, rebuild its jsonl + `--build`), width-2048 tokenizer (mean ceiling 50.5 vs 57.8), many more epochs (sequences are 5x cheaper now).
+
+## 2026-10-25: where things stand
+- **The EnCodec-token LLM is dead**: it ignored audio at 1000 and 2880 rows (gap +0.006/+0.007) and was no better than standing still on unseen clips. HuBERT layer-12 features carry the timing signal (probe).
+- **Metrics**: held-out MPJPE can't separate a good model from a still pose (one speech, many gestures). Rank models by `scripts/motion_dist_metrics.py` fd on **60** held-out clips (`NO_VIDEO=1 scripts/aligned_eval.py ... 60 sample,static,ceiling`; 20 clips are too noisy), plus the val NLL gap with audio rolled 5 s (`gap_shift`, audio timing use). Targets on 60 val clips: real motion of other clips fd 1.33, tokenizer ceiling 2.55, still pose 20.5.
+- **Small from-scratch model** (`speech_to_motion_small.py`, ~50M params, ~1-6 min/epoch) beats the LLM path on every metric so far and iterates ~100x faster. Best: `--local_audio --audio_drop 0.3 --hist_drop 0.2` (fd 5.14, gap_shift +0.09).
+- **Data**: every run used one 10 s window per recording (26 of ~255 h). `scripts/build_dense.py` -> outputs/run-full-q8-oct21-dense (46k windows, 128 h). Small models on it: small-dense-ad3-oct25, small-dense-base-oct25 (running).
+- Aligned LLM on the full single-window data (aligned-full-oct25) still training for comparison (~12 s/step).
+- Open: greedy decoding freezes for every model (use sampling); held-out ceiling (59 mm) vs train ceiling (~40 mm) says the tokenizer could also gain from dense data; stride-5 windows would double the data again.
+
+## 2026-10-26: decoding fixed, facing-direction bug found
+- **Top-p 0.9 was capping motion for every model** (incl. the LLM, `speech_to_motion_aligned.py` `generate`): a confident model puts > 0.9 on "repeat the previous token", so it can never change. Use top-p 1.
+- **Best so far**: `small-dense-ad3-oct25` (dense data, `--local_audio --audio_drop 0.3`), decoded `sample1.3p1` (temperature 1.3, top-p 1) with output smoothing sigma 2.5: 60-clip fd **3.69**, div_within 0.94, jerk 1.24x (still pose 20.5, tokenizer ceiling 2.55, real motion of other clips 1.33). Command: `NO_VIDEO=1 scripts/aligned_eval.py outputs/small-dense-ad3-oct25/best outputs/run-full-q8-oct21-dense outputs/run-full-q8-oct21/motion_tokenizer_artifacts <out> 60 sample1.3p1,static,ceiling 2.5`, then `motion_dist_metrics.py <out> outputs/run-full-q8-oct21/aligned_data` (always this reference: the dense data dir changes the PCA basis).
+- Dense data needs high temperature: its windows are calmer than val (each recording's most-moving window), so the model learns calmer motion. Filtering to moving windows (`--min_change`) did not help more than temperature.
+- **Facing bug** (user watched `outputs/fix-oct21/video_dense_ad3_t13s25/val394_CPO483_sample1.3p1.mp4`: "somewhat natural but ... facing wrong way and a bit wrong motion"): `preprocess_motion` makes translation relative to frame 0 but keeps `global_orient` absolute, so every model has to guess world facing, which audio cannot tell. Fix A: at eval, rotate the prediction's yaw to the GT's frame 0. Fix B: yaw relative to frame 0 in `preprocess_motion`, retrain the tokenizer (on dense data) and rebuild the data.
+- Model history, for anyone reading later: EnCodec audio tokens + Llama-3-8B ignored audio -> time-aligned HuBERT + the same Llama (still near static) -> small from-scratch transformer on the same HuBERT features and the same RVQ motion tokenizer (beats the LLM, ~100x faster to iterate). The LLM has not yet been sampled with top-p 1; `aligned-full-oct25` gets that test when it finishes.
+- Running: `small-dense-big1e4-oct25` (142M, lr 1e-4; lr 3e-4 never learned), aligned LLM `aligned-full-oct25`.
+
+## 2026-11-04: where things stand (CVPR: paper 16 Nov AoE, supplementary 23 Nov)
+- **Final models**: `dt-F2-cfg-oct30` (offline) and `dt-OL-cfg-oct30` (strict online, `--causal_audio`), trained on Embody-3D. BEAT2 versions are speaker-2 fine-tunes in the hand-weight-1.0 BEAT2 tokenizer: `beat2-ft-f2hw1.0-nov01`, `beat2-ft-olhw1.0-nov01`, plus the heading fix (`scripts/beat2_yaw_fix.py --anchor`).
+- **BEAT2 test (FGD / BC / L1div)**: ours offline 0.575 ± 0.011 / 0.77 / 13.1-13.4; online 0.607 ± 0.052 / 0.77; EMAGE 0.615 / 0.591 / 11.42; LoM 0.517 / 0.671 / 13.25; Super Star (trained by us) 3.154 / 0.477. Embody-3D: ours FD 3.4 / speech match 0.55 vs EMAGE retrained 6.1 / 0.17.
+- **Closed (no gain)**: all-speaker BEAT2 training, sampling sweep, longer training / FGD-picked checkpoints. Val FGD noise across draws is about ±0.03, so report means over draws.
+- **Ready**: user-study material (`outputs/userstudy-nov04/ab/`), figures (`outputs/figures-nov04/`). Hosting the study needs the user's OK (dataset licences, where to host).
+- **Open decisions (user)**: a second baseline on Embody-3D (Super Star retrained, ~3-4 days) and/or AMASS pretraining to chase LoM (needs a registered download, ~2-3 days).
+- **Next**: ablation table, user study, writing.
+
+## 2026-11-06: where things stand (current plan; supersedes the sections above)
+Paper story: **"Anticipate, don't peek"**: honest online co-speech motion. Method details: `docs/METHOD.md`.
+Paper tables: `docs/PAPER_RESULTS.md` (`python scripts/collect_results.py`). Embody paper numbers pool the fresh eval
+groups 1-4 (`EVAL_GROUP`); group 0 was used to choose recipes and inflates gains (Db - base +0.185 there, ~+0.05 on
+groups 1-3).
+
+**Contributions and status**
+| # | Contribution | Status |
+|---|---|---|
+| A | End-to-end look-ahead audit (`leak_probe.py`, `decoder_latency.py`): HuBERT full-window 6.93 s, symmetric decoder + smoothing 0.47 s | done |
+| B | Causal RVQ decoder (0 / 67 / 133 ms) + continuous streaming (M4) + jitter-free decoder | decoders done; 133 ms = old 467 ms on BEAT2 (0.545 vs 0.555); continuous seam 0.9 vs 19; jitter-free evals running |
+| C | Privileged-future guided on-policy distillation (deployment rollouts, guided teacher target) + level-aware weights (D) | Embody: significant on group 0 and +0.04-0.06 on fresh groups; BEAT2: no gain over forward KL |
+| P1 | Energy-guided streaming decoding (EBT-Policy style) | stage 1 (reward-matcher energy, causal): fresh group 1 0.350 -> 0.487, FD 5.88 -> 5.67; needs a non-matcher check; stage 2 (trained anticipatory energy) pending |
+| P2 | Uncertainty-adaptive guidance | running |
+| O1 | One model, any latency | 0 ms on par with the dedicated model; look-ahead barely helps on Embody, so a weak claim |
+| O2 | Signed lead/lag metric | real -167 ms, offline -133, online causal +67, Db +33 (group 0) / 0 (group 1) |
+| O4 | Benchmark metrics (speaking/listening, jerk, listener response, audited look-ahead, lead/lag) | metrics exist; benchmark packaging pending |
+
+**Dropped (no gain)**: partner audio, one-pass guided student, speech-salient weighting, anticipatory encoder loss
+(E) and so M1, GRPO, TIP, softer teacher. Parked: M2 beat-anticipation head. Skipped for now: person-disjoint split.
+
+**Next**: P1 independent check (BEAT2 FGD/BC or a differently built matcher) and stage 2; P2 results; final model;
+D1 MIBURI / GestureLSM baselines; D2 Super Star leak test; multi-speaker BEAT2; D5 user-study videos; writing
+(Nov 11-16). Paper deadline Nov 16 AoE, supplementary Nov 23.

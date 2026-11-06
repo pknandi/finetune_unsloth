@@ -112,6 +112,11 @@ def sixd_to_rotvec(x: np.ndarray) -> np.ndarray:
     m = np.stack([b1, b2, np.cross(b1, b2)], axis=-1)
     return Rotation.from_matrix(m).as_rotvec().reshape(T, -1).astype(np.float32)
 
+def heading_yaw(rotvec: np.ndarray) -> float:
+    """yaw (rad) about world +Y of the body's forward axis (+Z) for one axis-angle root rotation"""
+    f = Rotation.from_rotvec(rotvec).apply([0.0, 0.0, 1.0])
+    return float(np.arctan2(f[0], f[2]))
+
 def feature_dim(pose_repr: str) -> int:
     """Width of preprocess_motion's output: orient(6) + body + left/right hand + transl(3)."""
     return 6 + 3 + (126 + 180 if pose_repr == "6d" else 63 + 90)
@@ -161,6 +166,15 @@ def preprocess_motion(motion: np.ndarray, orient_repr: str = "6d", pose_repr: st
     # example's frame 0" are the same frame — this is not a per-window rebase.
     transl = motion[:, 156:159] - motion[0, 156:159]
 
+    # orient_repr="6d_rel" (2026-10-28): also remove the window's starting heading (yaw about the
+    # world up axis, +Y in Embody-3D). Which way a person faces in the room is as unpredictable
+    # from audio as the room position above, and with absolute facing every model had to guess it
+    # (the user saw generated people facing the wrong way). Turning during the window is kept.
+    if orient_repr == "6d_rel":
+        rot = Rotation.from_euler("y", -heading_yaw(global_orient[0]))
+        global_orient = (rot * Rotation.from_rotvec(global_orient)).as_rotvec()
+        transl = rot.apply(transl)
+
     # global_orient is a large-swing rotation whose axis-angle norm exceeds pi in raw mocap
     # data (up to 9.8 rad here). "sin/cos of each axis-angle component" (orient_repr="sincos",
     # the original encoding) is continuous, but it is NOT invertible to the same rotation:
@@ -169,7 +183,7 @@ def preprocess_motion(motion: np.ndarray, orient_repr: str = "6d", pose_repr: st
     # +25 mm root-relative MPJPE on the BWW760 target and +253 mm on GBM952 -- an error floor
     # no codebook size can remove. 6D rotation (first two matrix columns) is exact and
     # continuous, and takes the same 6 channels, so the feature width stays 162.
-    if orient_repr == "6d":
+    if orient_repr in ("6d", "6d_rel"):
         global_orient_feat = rotvec_to_6d(global_orient)
     elif orient_repr == "sincos":
         global_orient_feat = np.concatenate([np.sin(global_orient), np.cos(global_orient)], axis=-1)
@@ -193,7 +207,7 @@ def features_to_smplx(feat: np.ndarray, orient_repr: str = "6d", pose_repr: str 
     """Inverse of preprocess_motion: de-normalized features -> (T, 159) SMPL-X
     [global_orient(3) | body(63) | left_hand(45) | right_hand(45) | transl(3)], translation
     still clip-relative as trained."""
-    if orient_repr == "6d":
+    if orient_repr in ("6d", "6d_rel"):      # 6d_rel decodes facing +Z at frame 0 (re-apply a heading to place it)
         global_orient = sixd_to_rotvec(feat[:, 0:6])
     else:
         global_orient = np.arctan2(feat[:, 0:3], feat[:, 3:6])
@@ -209,8 +223,13 @@ def features_to_smplx(feat: np.ndarray, orient_repr: str = "6d", pose_repr: str 
 
 def smooth_features(feat: np.ndarray, sigma: float) -> np.ndarray:
     """Gaussian smoothing over time (sigma in frames) of de-normalized features, before
-    features_to_smplx. Safe for 6D channels: sixd_to_rotvec re-orthonormalizes. sigma <= 0 is a no-op."""
-    if sigma <= 0:
+    features_to_smplx. Safe for 6D channels: sixd_to_rotvec re-orthonormalizes. sigma 0 is a no-op; sigma < 0 is a
+    one-sided half-Gaussian of width -sigma over past frames only (causal, for online output)."""
+    if sigma < 0:                                   # one-sided (past frames only): no future motion, for online use
+        k = np.exp(-0.5 * (np.arange(int(4 * -sigma) + 1) / sigma) ** 2); k /= k.sum()
+        pad = np.concatenate([np.repeat(feat[:1], len(k) - 1, 0), feat], 0)
+        return sum(w * pad[len(k) - 1 - i:len(pad) - i] for i, w in enumerate(k)).astype(feat.dtype)
+    if sigma == 0:
         return feat
     from scipy.ndimage import gaussian_filter1d
     return gaussian_filter1d(feat, sigma, axis=0, mode="nearest").astype(feat.dtype)
@@ -246,6 +265,30 @@ class Normalizer:
 # ==========================================
 # 2. VQ-VAE Architecture
 # ==========================================
+class CausalDecoder(nn.Module):
+    """Drop-in for MotionVQVAE.decoder with no look-ahead: each token makes its own 2 frames (no overlapping transposed
+    conv), then left-padded convs, so frame 2k and 2k+1 depend only on tokens <= k (the decoder of
+    scripts/train_causal_decoder.py; the symmetric one reaches 5 frames back from a token, scripts/decoder_latency.py).
+    future=f > 0 lets token k's frames also see tokens k+1..k+f (f / 15 s of output latency), for the latency curve."""
+    def __init__(self, latent_dim=256, hidden_dim=256, input_dim=162, future=0):
+        super().__init__()
+        self.register_buffer("future", torch.tensor(future))
+        self.up = nn.Conv1d(latent_dim, 2 * hidden_dim, kernel_size=1)
+        self.convs = nn.ModuleList([nn.Conv1d(hidden_dim, hidden_dim, 3), nn.Conv1d(hidden_dim, hidden_dim, 5),
+                                    nn.Conv1d(hidden_dim, input_dim, 3)])
+
+    def forward(self, z):                                       # (B, latent, T) -> (B, input_dim, 2T)
+        f = int(self.future)
+        if f:                                                   # position k reads tokens up to k + f
+            z = torch.cat([z[:, :, f:], z[:, :, -1:].expand(-1, -1, f)], -1)
+        h = self.up(z)
+        h = h.view(h.shape[0], 2, -1, h.shape[-1]).permute(0, 2, 3, 1).reshape(h.shape[0], -1, 2 * h.shape[-1])
+        for i, c in enumerate(self.convs):
+            h = F.leaky_relu(h, 0.2)
+            h = c(F.pad(h, (c.kernel_size[0] - 1, 0)))
+        return h
+
+
 class MotionVQVAE(nn.Module):
     # num_quantizers=4 (RVQ levels) was the original choice; measured via a teacher-forced
     # accuracy/perplexity check on a real run-full-aug30 generation (10000 LLM training
@@ -257,7 +300,7 @@ class MotionVQVAE(nn.Module):
     # Dropping to 2 removes exactly the two levels with no real learned signal, rather
     # than giving the model more capacity to keep failing at the same overly-hard target.
     def __init__(self, input_dim=162, hidden_dim=256, latent_dim=256, codebook_size=1024,
-                 num_quantizers=2):
+                 num_quantizers=2, causal_decoder=False, dec_hidden=None, dec_future=0):
         super().__init__()
         
         # Encoder (2x temporal downsampling). Was 4x: each token covered an 8-16fps-
@@ -315,6 +358,9 @@ class MotionVQVAE(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Conv1d(hidden_dim, input_dim, kernel_size=3, stride=1, padding=1),
         )
+
+        if causal_decoder:
+            self.decoder = CausalDecoder(latent_dim, dec_hidden or hidden_dim, input_dim, dec_future)
 
     def forward(self, x):
         encoded = self.encoder(x).permute(0, 2, 1)
@@ -506,13 +552,18 @@ class VQVAETokenizer:
         hidden_dim = state["encoder.0.weight"].shape[0]
         latent_dim = state["encoder.4.weight"].shape[0]
         codebook_size = state["quantizer.layers.0._codebook.embed"].shape[-2]
-        if (n_levels != self.num_quantizers or input_dim != self.model.encoder[0].in_channels
+        causal = "decoder.up.weight" in state
+        if causal and "decoder.future" not in state:          # causal decoders saved before the future option
+            state["decoder.future"] = torch.tensor(0)
+        dec_kw = dict(dec_hidden=state["decoder.up.weight"].shape[0] // 2, dec_future=int(state["decoder.future"])) if causal else {}
+        if (causal or isinstance(self.model.decoder, CausalDecoder) or n_levels != self.num_quantizers or input_dim != self.model.encoder[0].in_channels
                 or hidden_dim != self.model.encoder[0].out_channels
                 or latent_dim != self.model.encoder[4].out_channels
                 or codebook_size != self.n_clusters):
             self.n_clusters = codebook_size
             self.model = MotionVQVAE(input_dim=input_dim, hidden_dim=hidden_dim, latent_dim=latent_dim,
-                                     codebook_size=codebook_size, num_quantizers=n_levels).to(self.device)
+                                     codebook_size=codebook_size, num_quantizers=n_levels,
+                                     causal_decoder=causal, **dec_kw).to(self.device)
         self.model.load_state_dict(state)
 
 

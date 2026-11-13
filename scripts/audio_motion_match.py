@@ -179,7 +179,7 @@ def score(ckpt, data, evs):
     for ev in evs:
         by_mode = defaultdict(dict)
         for p in glob.glob(f"{ev}/val*_*.npy"):
-            mt = re.match(r"val(\d+)_(.+)_([a-z0-9_.]+?)\.npy$", os.path.basename(p))
+            mt = re.match(r"val(\d+)_(.+)_([A-Za-z0-9_.-]+?)\.npy$", os.path.basename(p))
             if mt and not p.endswith("_ids.npy"):
                 by_mode[mt.group(3)][int(mt.group(1))] = p
         idx = sorted(set.intersection(*[set(d) for d in by_mode.values()]))

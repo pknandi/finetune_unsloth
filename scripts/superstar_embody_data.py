@@ -32,6 +32,7 @@ ap.add_argument("--val_data", default="outputs/run-full-dense-rel-oct28")
 ap.add_argument("--max_train", type=int, default=0)
 ap.add_argument("--eval_sec", type=float, default=10.0)
 ap.add_argument("--only_eval", action="store_true")
+ap.add_argument("--groups", default="", help="2026-11-08: add the fresh eval groups (e.g. 1,2,3,4,5,6,7) to an existing root")
 args = ap.parse_args()
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(REPO)
@@ -91,6 +92,38 @@ def write(job):
 
 
 if __name__ == "__main__":
+    if args.groups:
+        # fresh eval groups (scripts/aligned_eval.py EVAL_GROUP=k: 60 val windows each, disjoint from the default group),
+        # written as <sid>_<subject>_g<val index> at --eval_sec, appended to train_test_split.csv with type "groups"
+        # (ignored by Super Star's train / val / test splits) and listed per group in <out>/groups/g<k>.txt; Super Star
+        # reads only these ids with SS_ONLY_IDS (patched lom/data/mixed_dataset/dataset_a2m.py, dataset_mixed_vq.py)
+        va = list(csv.DictReader(open(f"{args.val_data}/val_windows.csv")))
+        random.seed(0); g0 = sorted(random.sample(range(len(va)), 60))
+        rest = [i for i in np.random.RandomState(0).permutation(len(va)) if i not in set(g0)]
+        subj = lambda a: os.path.basename(os.path.dirname(os.path.dirname(a)))
+        sid = {r["subject"]: int(r["number"]) for r in csv.DictReader(open(f"{args.out}/subjects.csv"))}
+        known = {r["id"] for r in csv.DictReader(open(f"{args.out}/train_test_split.csv"))}
+        os.makedirs(f"{args.out}/groups", exist_ok=True)
+        jobs, meta = [], []
+        for k in map(int, args.groups.split(",")):
+            ids = []
+            for i in sorted(rest[(k - 1) * 60:k * 60]):
+                a, st = va[i]["audio_filename"], float(va[i]["start_sec"])
+                if subj(a) not in sid:
+                    print(f"skip val {i}: subject {subj(a)} not in subjects.csv", flush=True); continue
+                rid = f"{sid[subj(a)]}_{subj(a)}_g{i}"; ids.append(rid)
+                if rid not in known:
+                    jobs.append((rid, a, st, args.eval_sec)); meta.append((rid, "groups", a, st, i))
+            open(f"{args.out}/groups/g{k}.txt", "w").write("\n".join(ids) + "\n")
+        with ProcessPoolExecutor(32) as ex:
+            done = dict(ex.map(write, jobs, chunksize=4))
+        keep = [x for x in meta if done.get(x[0], 0) > 0]
+        with open(f"{args.out}/train_test_split.csv", "a", newline="") as f:
+            csv.writer(f).writerows([(x[0], x[1]) for x in keep])
+        with open(f"{args.out}/windows.csv", "a", newline="") as f:
+            csv.writer(f).writerows(keep)
+        print(f"groups {args.groups}: wrote {len(keep)} of {len(jobs)} new windows", flush=True)
+        sys.exit(0)
     for d in ("smplxflame_30", "wave16k", "textgrid"):
         os.makedirs(f"{args.out}/{d}", exist_ok=True)
     tr = sorted({r["audio_filename"] for f in args.train_lists.split(",") for r in csv.DictReader(open(f))})

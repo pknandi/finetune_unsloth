@@ -11,7 +11,7 @@ Modes:
   emagevq     the real motion through EMAGE's part VQ-VAEs (upper / hands / lower indices): its tokenizer ceiling
 
 usage: python scripts/emage_bridge.py <data_dir> <out_dir> <n> <modes> [--weights <dir>] [--gen <dir>]
-<data_dir> and <n> must match the aligned_eval call (clip choice: random.seed(0), random.sample). Writes
+<data_dir> and <n> must match the aligned_eval call (clip choice: random.seed(0), random.sample; EVAL_GROUP=k as there). Writes
 <out_dir>/{val<i>,train0}_<subject>_<mode>.npy, (300, 159) axis-angle: orient, body, left hand, right hand, transl.
 """
 import os, sys, csv, glob, random, argparse
@@ -123,7 +123,11 @@ def run(mode, m, audio):
 va_w = list(csv.DictReader(open(f"{args.data}/val_windows.csv")))
 tr_w = list(csv.DictReader(open(f"{args.data}/train_windows.csv")))
 random.seed(0)
-clips = [("val", i, va_w[i]) for i in sorted(random.sample(range(len(va_w)), min(args.n, len(va_w))))]
+pick = sorted(random.sample(range(len(va_w)), min(args.n, len(va_w))))
+if int(os.environ.get("EVAL_GROUP", "0")):      # further disjoint window groups, exactly as scripts/aligned_eval.py
+    rest = [i for i in np.random.RandomState(0).permutation(len(va_w)) if i not in set(pick)]
+    k = int(os.environ["EVAL_GROUP"]); pick = sorted(rest[(k - 1) * args.n:k * args.n])
+clips = [("val", i, va_w[i]) for i in pick]
 clips.append(("train", 0, tr_w[0]))
 os.makedirs(args.out, exist_ok=True)
 for split, i, w in clips:
@@ -136,6 +140,9 @@ for split, i, w in clips:
     canon[:, 156:159] -= origin * np.array([1, 0, 1], np.float32)     # x, z start at 0 (y kept)
     audio, _ = librosa.load(audio_path, sr=16000, offset=start, duration=W / 30)
     audio = np.pad(audio, (0, max(0, W * 16000 // 30 - len(audio))))
+    if os.environ.get("LEAK_CUT"):      # look-ahead probe (scripts/emage_leak.sh): audio after this many s -> noise
+        k = int(float(os.environ["LEAK_CUT"]) * 16000)
+        audio[k:] = np.random.default_rng(i).normal(0, audio.std() + 1e-6, len(audio) - k).astype(audio.dtype)
     for mode in modes:
         npy = f"{args.out}/{split}{i}_{os.path.basename(subj_dir)}_{mode}.npy"
         if os.path.exists(npy):

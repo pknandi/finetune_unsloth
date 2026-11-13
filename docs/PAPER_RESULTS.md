@@ -8,8 +8,11 @@ speed features to the same windows' real motion; jerk ratio = generated / real j
 
 | Model | Speech match ↑ | Speaking | Listening | FD ↓ | Jerk ratio (1 = real) | Draws | Source |
 |---|---|---|---|---|---|---|---|
-| Online base (causal decoder) | 0.304 ± 0.020 | 0.346 | 0.269 | 3.14 ± 1.12 | 2.88 | 9 | e60_dt_OLs24_causal_grp1, e60_dt_OLs24_causal_grp2, e60_dt_OLs24_causal_grp3, e60_dt_OLs24_causal_grp4 [sample1.3p1f15g3.5] |
-| Online + ours, Db (causal decoder) | 0.354 ± 0.034 | 0.379 | 0.334 | 4.16 ± 1.30 | 2.63 | 9 | e60_dt_Db_nov06_causal_grp1, e60_dt_Db_nov06_causal_grp2, e60_dt_Db_nov06_causal_grp3, e60_dt_Db_nov06_causal_grp4 [sample1.3p1f15g3.5] |
+| EMAGE (offline, retrained on Embody-3D) | 0.163 ± 0.026 | 0.131 | 0.199 | 6.21 ± 1.41 | - | 4 | e60_emage_grp1, e60_emage_grp2, e60_emage_grp3, e60_emage_grp4 [emage] |
+| Ours offline teacher F2 (old decoder) | 0.603 ± 0.048 | 0.650 | 0.571 | 3.72 ± 1.02 | 0.44 | 12 | e60_dt_F2_grp1, e60_dt_F2_grp2, e60_dt_F2_grp3, e60_dt_F2_grp4 [sample1.3p1f15g3.5] |
+| Online base (causal decoder) | 0.291 ± 0.033 | 0.319 | 0.270 | 3.05 ± 0.97 | 2.90 | 12 | e60_dt_OLs24_causal_grp1, e60_dt_OLs24_causal_grp2, e60_dt_OLs24_causal_grp3, e60_dt_OLs24_causal_grp4 [sample1.3p1f15g3.5] |
+| Online + ours, Db (causal decoder) | 0.349 ± 0.031 | 0.357 | 0.349 | 4.17 ± 1.11 | 2.65 | 12 | e60_dt_Db_nov06_causal_grp1, e60_dt_Db_nov06_causal_grp2, e60_dt_Db_nov06_causal_grp3, e60_dt_Db_nov06_causal_grp4 [sample1.3p1f15g3.5] |
+| Online + ours, Db + adaptive guidance 1.5-5 | 0.389 ± 0.042 | 0.419 | 0.366 | 3.84 ± 1.08 | 2.42 | 12 | e60_dt_Db_adapt, e60_dt_Db_adapt_grp2, e60_dt_Db_adapt_grp3, e60_dt_Db_adapt_grp4 [sample1.3p1f15a1.5-5] |
 
 ### Embody-3D ablation (eval group 0, used to choose recipes; causal decoder unless noted)
 
@@ -26,8 +29,8 @@ speed features to the same windows' real motion; jerk ratio = generated / real j
 | Cb + speech-salient weights (Da, dropped) | 0.494 ± 0.051 | 0.495 | 0.493 | 3.65 ± 0.04 | 2.52 | 3 | e60_dt_Da_nov06_causal_stream [sample1.3p1f15g3.5] |
 | Db + anticipatory encoder loss (E1, dropped) | 0.533 ± 0.047 | 0.511 | 0.564 | 3.66 ± 0.06 | 2.22 | 3 | e60_dt_E1_nov06_causal_stream [sample1.3p1f15g3.5] |
 | Db, 2-token decoder (133 ms) | 0.552 ± 0.013 | 0.540 | 0.569 | 3.73 ± 0.06 | 1.98 | 3 | e60_dt_Db_nov06_cf2_stream [sample1.3p1f15g3.5] |
-| Db, jitter-free decoder (0 ms) | pending | | | | | | e60_dt_Db_nov06_jf0_stream |
-| Db, jitter-free decoder (133 ms) | pending | | | | | | e60_dt_Db_nov06_jf2_stream |
+| Db, jitter-free decoder (0 ms) | 0.531 ± 0.033 | 0.511 | 0.560 | 4.47 ± 0.15 | 1.36 | 3 | e60_dt_Db_nov06_jf0_stream [sample1.3p1f15g3.5] |
+| Db, jitter-free decoder (133 ms) | 0.498 ± 0.043 | 0.492 | 0.507 | 3.93 ± 0.08 | 1.30 | 3 | e60_dt_Db_nov06_jf2_stream [sample1.3p1f15g3.5] |
 | Offline teacher F2 (old decoder, hears the future) | 0.569 ± 0.032 | 0.474 | 0.703 | 3.49 ± 0.18 | 0.39 | 4 | e60_dt_F2_cfg, e60_dt_F2_more [sample1.3p1f15g3.5] |
 
 ### Decoding: energy-guided and adaptive guidance (fresh eval group 1)
@@ -37,8 +40,8 @@ speed features to the same windows' real motion; jerk ratio = generated / real j
 | Db, fixed guidance 3.5 | 0.350 ± 0.054 | 0.385 | 0.319 | 5.88 ± 0.08 | 2.41 | 3 | e60_dt_Db_nov06_causal_grp1 [sample1.3p1f15g3.5] |
 | Db + energy-guided decoding, causal (K=4) | 0.487 ± 0.047 | 0.544 | 0.437 | 5.67 ± 0.20 | 2.35 | 3 | e60_dt_Db_e4c [sample1.3p1f15g3.5e4c] |
 | Db + energy-guided decoding, oracle +160 ms (analysis) | 0.454 ± 0.023 | 0.488 | 0.424 | 5.83 ± 0.17 | 2.45 | 3 | e60_dt_Db_e4o8 [sample1.3p1f15g3.5e4o8] |
-| Db + adaptive guidance 1.5-5 | pending | | | | | | e60_dt_Db_adapt |
-| Db + adaptive guidance 1-7 | pending | | | | | | e60_dt_Db_adapt |
+| Db + adaptive guidance 1.5-5 | 0.426 ± 0.025 | 0.476 | 0.382 | 5.48 ± 0.02 | 2.24 | 3 | e60_dt_Db_adapt [sample1.3p1f15a1.5-5] |
+| Db + adaptive guidance 1-7 | 0.389 ± 0.024 | 0.468 | 0.319 | 5.51 ± 0.10 | 2.27 | 3 | e60_dt_Db_adapt [sample1.3p1f15a1-7] |
 
 ### One model, any latency vs dedicated models (old decoder, group 0)
 
@@ -49,9 +52,9 @@ speed features to the same windows' real motion; jerk ratio = generated / real j
 | 120 ms: dedicated | 0.433 ± 0.024 | 0.346 | 0.555 | 3.40 ± 0.21 | 0.41 | 3 | e60_dt_OLs24_la3 [sample1.3p1f15g3.5] |
 | 120 ms: one model | 0.398 ± 0.014 | 0.314 | 0.515 | 3.44 ± 0.09 | 0.42 | 3 | e60_dt_ANY_s3_stream [sample1.3p1f15g3.5] |
 | 280 ms: dedicated | 0.405 ± 0.039 | 0.353 | 0.480 | 3.51 ± 0.06 | 0.42 | 3 | e60_dt_OLs24_la7 [sample1.3p1f15g3.5] |
-| 280 ms: one model | pending | | | | | | e60_dt_ANY_s7_stream |
+| 280 ms: one model | 0.418 ± 0.032 | 0.336 | 0.533 | 3.27 ± 0.17 | 0.43 | 3 | e60_dt_ANY_s7_stream [sample1.3p1f15g3.5] |
 | 520 ms: dedicated | 0.406 ± 0.034 | 0.311 | 0.538 | 3.52 ± 0.22 | 0.40 | 3 | e60_dt_OLs24_la13 [sample1.3p1f15g3.5] |
-| 520 ms: one model | pending | | | | | | e60_dt_ANY_s13_stream |
+| 520 ms: one model | 0.415 ± 0.040 | 0.378 | 0.467 | 3.36 ± 0.13 | 0.42 | 3 | e60_dt_ANY_s13_stream [sample1.3p1f15g3.5] |
 
 ### BEAT2 (speaker 2 test, 5 seeded draws; val-picked guidance)
 

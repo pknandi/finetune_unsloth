@@ -13,7 +13,7 @@ usage: python speech_to_motion_small.py --data_dir <aligned_data> --out_dir <dir
 Each epoch prints: EVAL epoch= right= shift= other= gap_shift= gap_other= gap0_shift= win_shift= train_right=
 Saves <out_dir>/best/small.pt (by val right NLL) and <out_dir>/last/small.pt.
 """
-import os, json, time, math, argparse
+import os, csv, json, time, math, argparse
 import numpy as np
 import torch
 import torch.nn as nn
@@ -24,12 +24,29 @@ T_M = 150
 
 class SmallS2M(nn.Module):
     def __init__(self, Q, L, d=512, enc_layers=4, dec_layers=6, feat_mean=None, feat_std=None, local_audio=False, audio_drop=0.0, cond_drop=0.0, causal_audio=False, feat_shift=0, partner=0,
-                 p_mean=None, p_std=None, any_shifts=None):
+                 p_mean=None, p_std=None, any_shifts=None, onset=0, speakers=0, spk_default=0):
         super().__init__()
         self.Q, self.L, self.d, self.local_audio = Q, L, d, local_audio
         self.cfg = dict(Q=Q, L=L, d=d, enc_layers=enc_layers, dec_layers=dec_layers, local_audio=local_audio,
                         audio_drop=audio_drop, cond_drop=cond_drop, causal_audio=causal_audio, feat_shift=feat_shift,
-                        partner=partner, any_shifts=any_shifts)
+                        partner=partner, any_shifts=any_shifts, onset=onset, speakers=speakers, spk_default=spk_default)
+        # --speakers n (BEAT2 all-speaker training, 2026-11-08): a zero-initialised speaker embedding added to the audio
+        # input, so training on every BEAT2 speaker does not average their styles; model.cur_spk (B,) holds the batch's
+        # speaker numbers in training, otherwise every row uses spk_default (BEAT2 speaker 2 for our benchmark)
+        self.speakers, self.spk_default, self.cur_spk = speakers, spk_default, None
+        if speakers:
+            self.spk_emb = nn.Embedding(speakers, d)
+            nn.init.zeros_(self.spk_emb.weight)
+        # --onset k (speech-onset anticipation, 2026-11-07): a head on each causal audio slot predicts k classes (speaking
+        # now / next speech in 1..15 slots / none within 1 s; scripts/build_onset_labels.py, a training-only target) and
+        # its predicted distribution is added back to that slot through a zero-initialised projection, so the decoder
+        # gets an explicit "speech is about to start" signal computed from the past only
+        self.onset = onset
+        if onset:
+            self.on_head = nn.Linear(d, onset)
+            self.on_emb = nn.Linear(onset, d, bias=False)
+            nn.init.zeros_(self.on_emb.weight)
+        self.on_logits = None
         # --any_shifts "0,3,7,13" (one model, any latency; O1, 2026-11-06): each training batch draws one of these feature
         # shifts (look-ahead s / 25 s) and adds its learned latency embedding to the audio input; at inference the
         # latency is picked by setting model.feat_shift (load_trained: env ANY_SHIFT), so one model serves every latency
@@ -79,8 +96,42 @@ class SmallS2M(nn.Module):
 
     def encode_audio(self, feats):
         """(B, F, 1024) -> (B, T_M + L, d)"""
-        if self.feat_shift:
+        if self.__dict__.get("forecaster") is not None and self.feat_shift:
+            return self._encode_forecast(feats)
+        return self._encode(feats)
+
+    @torch.no_grad()
+    def _encode_forecast(self, feats, chunk=32):
+        """imagined look-ahead (2026-11-08): zero real look-ahead for a model trained with feat_shift s. Memory slot t
+        is computed from the real frames up to the slot's end e_t and, after them, the s frames that the speech
+        forecaster (audio_forecaster.py) predicted at frame e_t; later frames are not used by the causal encoder."""
+        B, Fr, _ = feats.shape; S = T_M + self.L; s = self.feat_shift
+        feats = feats.float()
+        fc = self.__dict__["forecaster"]
+        if fc == "oracle":                       # control: the same per-slot path with the REAL future frames (leaks)
+            idx = (torch.arange(Fr, device=feats.device)[:, None] + torch.arange(1, s + 1, device=feats.device)).clamp(max=Fr - 1)
+            pred = feats[:, idx]
+        else:
+            pred = fc(feats)                                                   # (B, Fr, K, 1024)
+        assert s <= pred.shape[2], (s, pred.shape)
+        ends = [min(Fr, -(-(t + 1) * Fr // S)) - 1 for t in range(S)]           # last real frame pooled into slot t
+        rows = []
+        for c in range(0, S, chunk):
+            ts = list(range(c, min(S, c + chunk)))
+            f = feats.repeat(len(ts), 1, 1)                                     # (len(ts) * B, Fr, 1024), slot-major
+            for j, t in enumerate(ts):
+                e = ends[t]; n = min(s, Fr - 1 - e)
+                if n > 0:
+                    f[j * B:(j + 1) * B, e + 1:e + 1 + n] = pred[:, e, :n]
+            m = self._encode(f)
+            rows += [m[j * B:(j + 1) * B, t] for j, t in enumerate(ts)]
+        return torch.stack(rows, 1)
+
+    def _encode(self, feats):
+        if self.feat_shift > 0:
             feats = torch.cat([feats[:, self.feat_shift:], feats[:, -1:].expand(-1, self.feat_shift, -1)], 1)
+        elif self.feat_shift < 0:      # 2026-11-12: audio DELAYED by -feat_shift frames (predict-ahead training only)
+            feats = torch.cat([feats[:, :1].expand(-1, -self.feat_shift, -1), feats[:, :self.feat_shift]], 1)
         if self.partner:
             feats, pf = feats[..., :1024], feats[..., 1024:]
         x = self.a_in((feats.float() - self.feat_mean) / self.feat_std)
@@ -88,13 +139,20 @@ class SmallS2M(nn.Module):
             x = x + self.p_in((pf.float() - self.p_mean) / self.p_std)
         if self.any_shifts:
             x = x + self.lat_emb.weight[self.any_shifts.index(self.feat_shift)]
+        if self.speakers:
+            ids = self.cur_spk if self.cur_spk is not None else torch.full((len(x),), self.spk_default, device=x.device)
+            x = x + self.spk_emb(ids.long())[:, None]
         x = x.transpose(1, 2)
         if self.causal_audio:
             x = F.pad(x, (2, 0))[:, :, :-2]      # delayed 2 frames: the centred kernel then sees t-4..t
         x = self.a_conv(x)
         x = F.adaptive_avg_pool1d(x, T_M + self.L).transpose(1, 2)
         mask = torch.triu(torch.full((T_M + self.L,) * 2, float("-inf"), device=x.device), 1) if self.causal_audio else None
-        return self.audio_drop(self.enc(x + self.a_pos, mask=mask))
+        h = self.enc(x + self.a_pos, mask=mask)
+        if self.onset:
+            self.on_logits = self.on_head(h)                                    # (B, T_M + L, onset), kept for the loss
+            h = h + self.on_emb(F.softmax(self.on_logits.float(), -1).to(h.dtype))
+        return self.audio_drop(h)
 
     def level_embed(self, codes):
         """(B, T, Q) -> (B, T, Q, d)"""
@@ -179,6 +237,9 @@ def load_trained(ckpt_dir):
     if model.any_shifts:                                   # any-latency model: which look-ahead to run at
         model.feat_shift = int(os.environ.get("ANY_SHIFT", "0"))
         assert model.feat_shift in model.any_shifts, (model.feat_shift, model.any_shifts)
+    if os.environ.get("FORECAST") and model.feat_shift:   # imagined look-ahead: forecast the shifted-in frames
+        from audio_forecaster import load_forecaster
+        model.__dict__["forecaster"] = "oracle" if os.environ["FORECAST"] == "oracle" else load_forecaster(os.environ["FORECAST"])
     model.eval()
     return model, None, None
 
@@ -265,6 +326,16 @@ def train(args):
         tr_m = np.concatenate([tr_m, np.load(f"{args.extra_data}/train_motion.npy")])
         tr_f = Cat(tr_f, np.load(f"{args.extra_data}/train_hubert.npy", mmap_mode="r"))
         print(f"extra_data {args.extra_data}: {len(tr_m)} train rows", flush=True)
+    xidx = None
+    if os.environ.get("EXCLUDE_SPEAKERS"):        # 2026-11-13 held-out speakers: drop every train window of these people
+        ex = set(open(os.environ["EXCLUDE_SPEAKERS"]).read().split())
+        names = [os.path.basename(os.path.dirname(os.path.dirname(w["audio_filename"])))
+                 for d in [args.data_dir] + ([args.extra_data] if args.extra_data else [])
+                 for w in csv.DictReader(open(f"{d}/train_windows.csv"))]
+        assert len(names) == len(tr_m) and not args.partner and not args.max_rows and not args.speakers
+        xidx = np.array([i for i, n in enumerate(names) if n not in ex])
+        tr_m, tr_f = tr_m[xidx], Rows(tr_f, xidx)
+        print(f"EXCLUDE_SPEAKERS {len(ex)} people: {len(names)} -> {len(xidx)} train rows", flush=True)
     p_stats = {}
     if args.partner:
         tr_p = np.load(f"{args.data_dir}/train_partner.npy", mmap_mode="r")
@@ -283,6 +354,8 @@ def train(args):
         if args.extra_data:
             sp = np.concatenate([sp, np.load(f"{args.extra_data}/train_speech.npy")])
         sp = np.nan_to_num(sp, nan=0.0)
+        if xidx is not None:
+            sp = sp[xidx]
         assert len(sp) == len(tr_m), "speech filters need train_speech.npy for every row"
         keep = np.where(sp >= args.min_speech)[0]
         if args.speech_rep > 1:     # windows with speech share >= speech_thr appear speech_rep times per epoch
@@ -299,11 +372,20 @@ def train(args):
     samp = np.asarray(tr_f[np.linspace(0, len(tr_f) - 1, min(256, len(tr_f))).astype(int)], np.float32)[..., :1024].reshape(-1, 1024)
     model = SmallS2M(Q, L, args.d, args.enc_layers, args.dec_layers, samp.mean(0), samp.std(0) + 1e-4,
                      args.local_audio, args.audio_drop, args.cond_drop, args.causal_audio, args.feat_shift,
-                     args.partner, **p_stats, any_shifts=[int(x) for x in args.any_shifts.split(",")] if args.any_shifts else None).cuda()
+                     args.partner, **p_stats, any_shifts=[int(x) for x in args.any_shifts.split(",")] if args.any_shifts else None,
+                     speakers=args.speakers, spk_default=args.spk_default).cuda()
+    tr_spk = None
+    if args.speakers:                                     # speaker number = first field of the BEAT2 recording id
+        num = lambda a: int(os.path.basename(a).split("_")[0])
+        tr_spk = np.array([num(w["audio_filename"]) for w in csv.DictReader(open(f"{args.data_dir}/train_windows.csv"))])
+        assert not (args.extra_data or args.min_speech or args.speech_rep > 1 or args.min_change), "row filters not aligned with speakers"
+        tr_spk = tr_spk[:args.max_rows] if args.max_rows else tr_spk
+        assert len(tr_spk) == len(tr_m) and tr_spk.max() < args.speakers, (len(tr_spk), len(tr_m), tr_spk.max())
+        print(f"speakers: {len(set(tr_spk.tolist()))} in train, default {args.spk_default}", flush=True)
     if args.init:
         st = torch.load(f"{args.init}/small.pt", map_location="cpu")["state"]     # incl. the init's HuBERT normaliser
         miss = model.load_state_dict(st, strict=False)
-        assert not miss.unexpected_keys and set(miss.missing_keys) <= {"a_null", "p_in.weight", "p_in.bias", "p_mean", "p_std", "lat_emb.weight"}, miss
+        assert not miss.unexpected_keys and set(miss.missing_keys) <= {"a_null", "p_in.weight", "p_in.bias", "p_mean", "p_std", "lat_emb.weight", "spk_emb.weight"}, miss
         print(f"init from {args.init}", flush=True)
     print(f"params {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M", flush=True)
     if args.partner and args.p_lr_mult != 1:            # the new partner projection learns faster than the init's weights
@@ -330,7 +412,10 @@ def train(args):
             f = torch.as_tensor(np.asarray(tr_f[b]), device="cuda")
             if model.any_shifts:
                 model.feat_shift = int(np.random.choice(model.any_shifts))
+            if tr_spk is not None:
+                model.cur_spk = torch.as_tensor(tr_spk[b], device="cuda")
             nll, m = motion_nll(model, f, c, args.hist_drop, args.cond_drop)
+            model.cur_spk = None
             loss = (nll * m).sum() / m.sum()
             opt.zero_grad(set_to_none=True); loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -379,6 +464,8 @@ if __name__ == "__main__":
     ap.add_argument("--feat_shift", type=int, default=0, help="with --causal_audio: lookahead of this many 25 fps feature frames")
     ap.add_argument("--audio_drop", type=float, default=0.0, help="dropout on the encoded audio")
     ap.add_argument("--patience", type=int, default=10)
+    ap.add_argument("--speakers", type=int, default=0, help="speaker embedding table size (BEAT2: 31, ids = recording prefix)")
+    ap.add_argument("--spk_default", type=int, default=0, help="speaker used outside training batches (BEAT2 benchmark: 2)")
     ap.add_argument("--save_every", type=int, default=0, help="also keep <out_dir>/ep<N> every N epochs (pick by val FGD)")
     ap.add_argument("--val_rows", type=int, default=531)
     ap.add_argument("--max_rows", type=int, default=0)

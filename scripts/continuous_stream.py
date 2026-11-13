@@ -11,7 +11,7 @@ scripts/motion_dist_metrics.py, speed and jerk ratio to real), the pose jump at 
 a reset baseline (independent unseeded 10 s windows, concatenated).
 
 usage: python scripts/continuous_stream.py <ckpt> <tok_dir> <out_dir> [--sigma -2.5] [--dur 60] [--hop 2] [--n 20]
-       [--temp 1.3] [--guid 3.5]
+       [--temp 1.3] [--guid 3.5] [--adapt 1.5 5]
 """
 import os, sys, csv, argparse
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -31,6 +31,7 @@ ap.add_argument("--sigma", type=float, default=-2.5); ap.add_argument("--dur", t
 ap.add_argument("--hop", type=float, default=2.0); ap.add_argument("--n", type=int, default=20)
 ap.add_argument("--temp", type=float, default=1.3); ap.add_argument("--guid", type=float, default=3.5)
 ap.add_argument("--data", default="outputs/stream-hubert-nov04")
+ap.add_argument("--adapt", type=float, nargs=2, default=None, help="uncertainty-adaptive guidance g_min g_max (replaces --guid)")
 args = ap.parse_args()
 os.makedirs(args.out, exist_ok=True)
 torch.manual_seed(0); np.random.seed(0)
@@ -79,7 +80,8 @@ def to_world(m, ref):
 
 
 def gen(feats, prefix=None):
-    return generate(model, None, None, feats, do_sample=True, temperature=args.temp, top_p=1.0, prefix=prefix, guidance=args.guid)
+    return generate(model, None, None, feats, do_sample=True, temperature=args.temp, top_p=1.0, prefix=prefix, guidance=args.guid,
+                    adapt=tuple(args.adapt) if args.adapt else None)
 
 
 def stream(audio, t0):

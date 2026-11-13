@@ -104,8 +104,12 @@ for split, i, w, f, m in clips:
                 # ...s<k>: another independent sample with the same settings (repeat draws for error bars)
                 # ...a<gmin>-<gmax>: guidance per frame from g_min to g_max by the model's uncertainty (P2)
                 # ...e<K><c|o<d>>: energy-guided decoding (scripts/energy_decode.py): best of K candidates per 1 s chunk by
-                # the reward matcher's energy, causal (c) or oracle with d 50 fps frames of future audio (o<d>)
-                mt = re.match(r"sample([0-9.]*)(?:p([0-9.]+))?(?:c(\d+))?(?:f(\d+))?(?:g([0-9.]+))?(?:e(\d+)(c|o\d+))?(?:a([0-9.]+)-([0-9.]+))?(?:s(\d+))?$", mode)
+                # the reward matcher's energy, causal (c) or oracle with d 50 fps frames of future audio (o<d>), or (t) the
+                # privileged teacher's energy (ENERGY_TEACHER, full-window features from ENERGY_TDATA; oracle analysis), or (d / dr)
+                # the distilled causal energy head (ENERGY_HEAD, scripts/train_energy.py), dr = with retry when the energy is high
+                # ...e<K><kind>k<C>: (2026-11-11) energy chunks of C slots (default 15 = 0.93 s audio look-ahead; k1 = zero
+                # look-ahead), the head scoring the last 15 slots of states (past kept slots + the candidate)
+                mt = re.match(r"sample([0-9.]*)(?:p([0-9.]+))?(?:c(\d+))?(?:f(\d+))?(?:g([0-9.]+))?(?:e(\d+)(c|t|T|dr|d|r|o\d+)(?:k(\d+))?)?(?:a([0-9.]+)-([0-9.]+))?(?:s(\d+))?$", mode)
                 kw = {"temperature": float(mt.group(1) or 1)} if mt else {}
                 if mt and mt.group(2):
                     kw["top_p"] = float(mt.group(2))
@@ -115,16 +119,28 @@ for split, i, w, f, m in clips:
                     kw["prefix"] = m[:int(mt.group(4))].astype(np.int64)
                 if mt and mt.group(5):
                     kw["guidance"] = float(mt.group(5))
-                if mt and mt.group(8):                                 # ...a<gmin>-<gmax>: uncertainty-adaptive guidance (P2)
-                    kw["adapt"] = (float(mt.group(8)), float(mt.group(9)))
+                if mt and mt.group(9):                                 # ...a<gmin>-<gmax>: uncertainty-adaptive guidance (P2)
+                    kw["adapt"] = (float(mt.group(9)), float(mt.group(10)))
+                if mt and mt.group(8):                                 # ...k<C>: energy chunk size, head over 15 slots
+                    kw["C"] = int(mt.group(8)); kw["win"] = 15
                 if mt and mt.group(6) and split == "val":
                     sys.path.insert(0, f"{REPO}/scripts"); from energy_decode import generate_energy
                     full = np.asarray(np.load("outputs/run-full-q8-oct21/aligned_data/val_hubert.npy", mmap_mode="r")[i], np.float32)
                     full = np.repeat((full[0:len(full) // 2 * 2:2] + full[1:len(full) // 2 * 2:2]) / 2, 2, 0)   # as the reward matcher was trained
                     causal = np.repeat(np.asarray(f, np.float32)[:, :1024], 2, 0)
                     kw.pop("top_p", None); kw.pop("temp_levels", None)
-                    ids = generate_energy(lm, f, causal, full, tok_dir, K=int(mt.group(6)), energy=mt.group(7), sigma=sigma, **kw)
-                else:
+                    if os.environ.get("ENERGY_PLAN"):              # 2026-11-12: "<H>x<commit>", zero look-ahead planning
+                        kw["plan"] = tuple(int(x) for x in os.environ["ENERGY_PLAN"].split("x"))
+                    tf = None
+                    if mt.group(7) in ("t", "T"):                    # privileged teacher energy: its full-window features
+                        tf = np.load(f"{os.environ.get('ENERGY_TDATA', 'outputs/run-full-dense-rel-oct28')}/val_hubert.npy", mmap_mode="r")[i]
+                    ids = generate_energy(lm, f, causal, full, tok_dir, K=int(mt.group(6)), energy="d" if mt.group(7) == "dr" else mt.group(7), sigma=sigma,
+                                          teacher=os.environ.get("ENERGY_TEACHER", "outputs/dt-F2-cfg-oct30/best"), t_feats=tf,
+                                          head=os.environ.get("ENERGY_HEAD", "outputs/energy-head-nov06/energy_head.pt"),
+                                          retry=1.0 if mt.group(7) == "dr" else 0.0,
+                                          t_head=os.environ.get("ENERGY_THEAD", "outputs/energy-teacher-nov06/energy_teacher.pt"), **kw)
+                else:   # 2026-11-12: train-split windows decode without energy; drop the energy-only k<C> args
+                    kw.pop("C", None); kw.pop("win", None)
                     ids = generate(lm, io, bos, f, do_sample=bool(mt), **kw)
             np.save(f"{out}/{tag}_ids.npy", ids)
             np.save(npy, place(motion_ids_to_smplx(ids, f"{tok_dir}/tokenizer.pt", f"{tok_dir}/normalizer.npz", sigma), audio, start))

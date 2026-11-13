@@ -228,7 +228,22 @@ def smooth_features(feat: np.ndarray, sigma: float) -> np.ndarray:
     if sigma < 0:                                   # one-sided (past frames only): no future motion, for online use
         k = np.exp(-0.5 * (np.arange(int(4 * -sigma) + 1) / sigma) ** 2); k /= k.sum()
         pad = np.concatenate([np.repeat(feat[:1], len(k) - 1, 0), feat], 0)
-        return sum(w * pad[len(k) - 1 - i:len(pad) - i] for i, w in enumerate(k)).astype(feat.dtype)
+        out = sum(w * pad[len(k) - 1 - i:len(pad) - i] for i, w in enumerate(k)).astype(feat.dtype)
+        # 2026-11-12: RENDER_LEADCOMP=<g> (causal lag compensation): the half-Gaussian delays motion by sum(i k_i)
+        # frames; add g x that delay x the smoothed velocity (past frames only), i.e. extrapolate the smoothed signal
+        # forward by its own delay (alpha-beta / lead filter). g = 0 (default) is the plain one-sided smoothing.
+        g = float(os.environ.get("RENDER_LEADCOMP", "0"))
+        if g:
+            d = g * float((np.arange(len(k)) * k).sum())
+            vel = np.concatenate([np.zeros_like(out[:1]), np.diff(out, axis=0)], 0)
+            vs = float(os.environ.get("RENDER_LEADCOMP_VS", "0"))   # 2026-11-12: one-sided smoothing of the velocity
+            if vs:                                                  # (raw velocity x2 amplified jitter: eval jerk 7.4)
+                kv = np.exp(-0.5 * (np.arange(int(4 * vs) + 1) / vs) ** 2); kv /= kv.sum()
+                pv = np.concatenate([np.repeat(vel[:1], len(kv) - 1, 0), vel], 0)
+                vel = sum(w * pv[len(kv) - 1 - i:len(pv) - i] for i, w in enumerate(kv))
+                d = d + g * float((np.arange(len(kv)) * kv).sum())      # the velocity's own delay is compensated too
+            out = (out + d * vel).astype(feat.dtype)
+        return out
     if sigma == 0:
         return feat
     from scipy.ndimage import gaussian_filter1d

@@ -25,6 +25,11 @@ ap.add_argument("--seed_frames", type=int, default=15); ap.add_argument("--draw"
 ap.add_argument("--split", default="test"); ap.add_argument("--lookahead", type=int, default=8)
 ap.add_argument("--ceiling", action="store_true", help="the real tokens of each window decoded: the tokenizer's best")
 ap.add_argument("--max_recs", type=int, default=0, help="smoke test: first N recordings")
+ap.add_argument("--adapt", type=float, nargs=2, default=None, help="uncertainty-adaptive guidance (P2): g_min g_max")
+ap.add_argument("--energy_kind", default="c", help="c: reward-matcher energy; t: privileged teacher energy (--energy_teacher, full-window audio)")
+ap.add_argument("--energy_teacher", default="outputs/beat2-ft-f2hw1.0-nov01/best")
+ap.add_argument("--energy_thead", default="outputs/energy-teacher-b2-nov06/energy_teacher.pt", help="privileged energy head (kind T)")
+ap.add_argument("--energy_head", default="", help="distilled causal energy head (kind d)")
 ap.add_argument("--energy", type=int, default=0, help="energy-guided decoding (scripts/energy_decode.py), K candidates per 1 s chunk, causal")
 ap.add_argument("--stream", action="store_true", help="online-honest audio: HubertFeaturizer.stream (each slot from audio up to its end)")
 args = ap.parse_args()
@@ -94,11 +99,17 @@ for r in recs:
         elif args.energy:
             from energy_decode import generate_energy
             causal = np.repeat(np.asarray(f, np.float32), 2, 0)
-            ids = generate_energy(model, f, causal, causal, args.tok, K=args.energy, energy="c", temperature=args.temperature,
-                                  guidance=args.guidance, prefix=prefix, sigma=args.sigma)
+            tf = None
+            if args.energy_kind in ("t", "T"):              # the offline teacher's full-window features (privileged)
+                h = feat(w[None])[0, :2 * NF].astype(np.float32)
+                tf = ((h[0::2] + h[1::2]) / 2).astype(np.float16)
+            ids = generate_energy(model, f, causal, causal, args.tok, K=args.energy, energy=args.energy_kind,
+                                  temperature=args.temperature, guidance=args.guidance, prefix=prefix, sigma=args.sigma,
+                                  teacher=args.energy_teacher, t_feats=tf, t_head=args.energy_thead,
+                                  head=args.energy_head or None, adapt=tuple(args.adapt) if args.adapt else None)
         else:
             ids = generate(model, io, bos, f, do_sample=True, temperature=args.temperature, top_p=args.top_p,
-                           prefix=prefix, guidance=args.guidance)
+                           prefix=prefix, guidance=args.guidance, adapt=tuple(args.adapt) if args.adapt else None)
         m = place(motion_ids_to_smplx(ids, f"{args.tok}/tokenizer.pt", f"{args.tok}/normalizer.npz", args.sigma), g0)
         a = round(s * FPS)
         out = np.concatenate([out[:a + (2 * SEED if k else 0)], m[2 * SEED if k else 0:]])

@@ -56,8 +56,11 @@ mean = lambda v, d=3: "-" if not v else f"{st.mean(v):.{d}f}"
 
 # ---------------------------------------------------------------- tables
 EMB_MAIN = [  # label, logs, mode prefix, note
+    ("EMAGE (offline, retrained on Embody-3D)", [f"e60_emage_grp{g}" for g in (1, 2, 3, 4)], "emage", "eval groups 1-4, 1 sample"),
+    ("Ours offline teacher F2 (old decoder)", [f"e60_dt_F2_grp{g}" for g in (1, 2, 3, 4)], "sample1.3p1f15g3.5", "eval groups 1-4"),
     ("Online base (causal decoder)", [f"e60_dt_OLs24_causal_grp{g}" for g in (1, 2, 3, 4)], "sample1.3p1f15g3.5", "eval groups 1-4"),
     ("Online + ours, Db (causal decoder)", [f"e60_dt_Db_nov06_causal_grp{g}" for g in (1, 2, 3, 4)], "sample1.3p1f15g3.5", "eval groups 1-4"),
+    ("Online + ours, Db + adaptive guidance 1.5-5", ["e60_dt_Db_adapt"] + [f"e60_dt_Db_adapt_grp{g}" for g in (2, 3, 4)], "sample1.3p1f15a1.5-5", "eval groups 1-4"),
 ]
 EMB_ABL = [  # group 0 (the group recipes were chosen on), causal decoder unless noted
     ("Base, old symmetric decoder (467 ms output look-ahead)", ["e60_dt_OLs24_stream", "e60_dt_OLs24_more_stream"], "sample1.3p1f15g3.5"),

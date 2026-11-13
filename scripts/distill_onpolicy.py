@@ -20,6 +20,9 @@ weights the RVQ levels (coarse = timing, fine = detail).
 --anti_w a (contribution E, anticipatory encoder): a cosine loss making a linear map of the student's causal audio
 memory at each slot predict the teacher's full-window audio memory at that slot (which has heard the future), so the
 online encoder learns to anticipate what is coming instead of hearing it; the map is a training-only head (not saved).
+--onset k --onset_w w (speech-onset anticipation, 2026-11-07): adds the model's onset head (speech_to_motion_small.py) and
+trains it with cross-entropy on <s_data>/{split}_onset.npy (scripts/build_onset_labels.py: time to the next speech onset,
+from future loudness; a training-only target); its causal prediction is fed back into the audio memory.
 --grpo_w adds GRPO (group-relative REINFORCE, --group rollouts per window) with a speech-match reward from a
 separate reward matcher (scripts/audio_motion_match.py, MATCH_SEED=1 MATCH_POOL=1), next to the KL (RISE-style).
 
@@ -58,6 +61,9 @@ ap.add_argument("--sal_w", type=float, default=0.0, help="weight tokens by (audi
 ap.add_argument("--lvl_w", default="", help="comma list of Q per-level KL weights (default all 1)")
 ap.add_argument("--anti_w", type=float, default=0.0, help="weight of the anticipation loss (student memory -> teacher memory)")
 ap.add_argument("--seed", type=int, default=0, help="training seed (the eval60 hold-out stays seed 0)")
+ap.add_argument("--onset", type=int, default=0, help="add the onset-anticipation head with this many classes (17)")
+ap.add_argument("--onset_w", type=float, default=0.0, help="weight of its cross-entropy on <s_data>/{split}_onset.npy")
+ap.add_argument("--onset_lr", type=float, default=1e-3, help="learning rate of the (new) onset head")
 ap.add_argument("--keep_eval60", action="store_true", help="do not hold out the 60 Embody eval windows (BEAT2: own val split)")
 args = ap.parse_args()
 torch.manual_seed(args.seed); np.random.seed(args.seed); random.seed(args.seed)
@@ -78,11 +84,24 @@ def load_split(split):
         S.append(np.load(f"{sd}/{split}_hubert.npy", mmap_mode="r"))
         T.append((np.load(f"{td}/{split}_hubert.npy", mmap_mode="r"), rows))
         M.append(np.load(f"{sd}/{split}_motion.npy"))
+        if args.onset_w:
+            ON.setdefault(split, []).append(np.load(f"{sd}/{split}_onset.npy"))
     return S, T, M
 
 
+ON = {}                                                       # onset targets per split, per data dir
 tr_S, tr_T, tr_M = load_split("train"); va_S, va_T, va_M = load_split("val")
 sizes = [len(m) for m in tr_M]
+# 2026-11-13 held-out speakers: EXCLUDE_SPEAKERS=<file of subject ids> drops every train window of those people
+ALLOW = [np.arange(n) for n in sizes]
+if os.environ.get("EXCLUDE_SPEAKERS"):
+    _ex = set(open(os.environ["EXCLUDE_SPEAKERS"]).read().split())
+    _spk = lambda a: os.path.basename(os.path.dirname(os.path.dirname(a)))
+    ALLOW = [np.array([i for i, w in enumerate(csv.DictReader(open(f"{sd}/train_windows.csv"))) if _spk(w["audio_filename"]) not in _ex])
+             for sd in args.s_data.split(",") if os.path.exists(f"{sd}/train_hubert.npy")]
+    assert len(ALLOW) == len(sizes)
+    print(f"EXCLUDE_SPEAKERS {len(_ex)} people: train windows {sizes} -> {[len(a) for a in ALLOW]}", flush=True)
+    sizes = [len(a) for a in ALLOW]
 print(f"train windows {sizes}, val {[len(m) for m in va_M]}", flush=True)
 random.seed(0)
 eval60 = set() if args.keep_eval60 else set(random.sample(range(len(va_M[0])), 60))   # scripts/aligned_eval.py's windows
@@ -99,11 +118,23 @@ def batch(S, T, M, part, rows):
 
 
 student = load_trained(args.student)[0]; teacher = load_trained(args.teacher)[0]
+if args.onset and not student.onset:                          # add the onset head to a checkpoint without it
+    from speech_to_motion_small import SmallS2M
+    st = student.state_dict(); student = SmallS2M(**{**student.cfg, "onset": args.onset}).cuda()
+    miss = student.load_state_dict(st, strict=False)
+    assert not miss.unexpected_keys and set(miss.missing_keys) <= {"on_head.weight", "on_head.bias", "on_emb.weight"}, miss
+# 2026-11-12, predict-ahead training: STUDENT_AUDIO_DELAY=d (25 fps feature frames) feeds the student its streamed
+# features d frames LATE during distillation (slot t hears audio up to ~t - 40d ms) while the targets stay at t, so it
+# learns to move ahead of the audio it hears; the saved cfg keeps feat_shift 0, so at deployment it hears the audio
+# up to its own slot (zero look-ahead) and its motion leads by ~40d ms.
+if int(os.environ.get("STUDENT_AUDIO_DELAY", "0")):
+    student.feat_shift = -int(os.environ["STUDENT_AUDIO_DELAY"])
 for p in teacher.parameters():
     p.requires_grad_(False)
 teacher.eval()
 Q = student.Q
-assert teacher.Q == Q and student.cfg["causal_audio"] and not teacher.cfg["causal_audio"]
+# SELF_TEACHER=1 (2026-11-12 control): a causal teacher without future audio (the online base itself)
+assert teacher.Q == Q and student.cfg["causal_audio"] and (os.environ.get("SELF_TEACHER") == "1" or not teacher.cfg["causal_audio"])
 
 
 @torch.no_grad()
@@ -208,7 +239,7 @@ def rev_kl(fs, ft, ids, P, fwd=False, tip=1.0, t_temp=1.0, logp=False, t_guid=1.
 
 def validate():
     student.eval()
-    kl, nll = [], []
+    kl, nll, ons = [], [], []
     for i in range(0, len(va_rows), 16):
         fs, ft, m = batch(va_S, va_T, va_M, 0, va_rows[i:i + 16])
         ids = rollout(fs, m, args.seed_frames, args.roll_temp, args.roll_guid)
@@ -216,8 +247,22 @@ def validate():
             kl.append(rev_kl(fs, ft, ids, args.seed_frames, t_guid=args.t_guid).item())
             n, ok = motion_nll(student, fs, m)
             nll.append(((n * ok).sum() / ok.sum()).item())
+            if args.onset_w:
+                ol, oa = onset_loss(ON["val"][0][np.sort(va_rows[i:i + 16])])
+                ons.append((ol.item(), oa.item()))
     student.train()
+    if ons:
+        print(f"VAL onset_ce={np.mean([o[0] for o in ons]):.4f} onset_acc={np.mean([o[1] for o in ons]):.3f}", flush=True)
     return float(np.mean(kl)), float(np.mean(nll))
+
+
+def onset_loss(y):
+    """cross-entropy of the student's onset head (from its last encode_audio call, real audio) on the targets y"""
+    y = torch.as_tensor(y, device="cuda").long()
+    lg = student.on_logits.float()[:, :y.shape[1]]
+    ok = y >= 0
+    ce = F.cross_entropy(lg[ok], y[ok])
+    return ce, (lg.argmax(-1)[ok] == y[ok]).float().mean()
 
 
 anti = nn.Linear(student.d, teacher.d).cuda() if args.anti_w else None     # training-only anticipation head
@@ -232,7 +277,10 @@ def anti_loss(fs, ft):
     return (1 - F.cosine_similarity(anti(ms.float()), mt.float(), dim=-1)).mean()
 
 
-opt = torch.optim.AdamW([p for p in student.parameters() if p.requires_grad] + (list(anti.parameters()) if anti else []),
+new = {n for n, _ in student.named_parameters() if n.startswith(("on_head.", "on_emb."))}   # fresh onset head: own lr
+opt = torch.optim.AdamW([{"params": [p for n, p in student.named_parameters() if p.requires_grad and n not in new]
+                          + (list(anti.parameters()) if anti else [])},
+                         {"params": [p for n, p in student.named_parameters() if n in new], "lr": args.onset_lr}],
                         lr=args.lr, weight_decay=0.05)
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1, (s + 1) / args.warmup) *
                                           0.5 * (1 + math.cos(math.pi * min(1.0, s / args.steps))))
@@ -247,7 +295,8 @@ student.train()
 for step in range(1, args.steps + 1):
     part = int(np.random.choice(len(sizes), p=np.array(sizes) / sum(sizes)))
     G = args.group if args.grpo_w else 1
-    fs, ft, m = batch(tr_S, tr_T, tr_M, part, np.random.choice(sizes[part], args.batch // G, replace=False))
+    rows = ALLOW[part][np.random.choice(sizes[part], args.batch // G, replace=False)]
+    fs, ft, m = batch(tr_S, tr_T, tr_M, part, rows)
     if G > 1:
         fs, ft, m = fs.repeat_interleave(G, 0), ft.repeat_interleave(G, 0), m.repeat_interleave(G, 0)
     P = args.seed_frames if np.random.rand() < 0.5 else 0
@@ -264,6 +313,9 @@ for step in range(1, args.steps + 1):
         kl = torch.zeros((), device="cuda")
     n, ok = motion_nll(student, fs, m, args.hist_drop, args.cond_drop)
     loss = args.kl_w * kl + args.fwd_w * fk + args.grpo_w * pg + args.nll_w * (n * ok).sum() / ok.sum()
+    if args.onset_w:                                            # on_logits of motion_nll's encode_audio (real audio)
+        ol, _ = onset_loss(np.repeat(ON["train"][part][np.sort(rows)], G, 0) if G > 1 else ON["train"][part][np.sort(rows)])
+        loss = loss + args.onset_w * ol; rw = ol.detach()      # logged in the reward= slot
     if anti is not None:
         al = anti_loss(fs, ft); loss = loss + args.anti_w * al; rw = al.detach()     # logged in the reward= slot
     opt.zero_grad(set_to_none=True); loss.backward()
